@@ -8,7 +8,7 @@ services:
     container_name: td-backend
     ports:
       - "8000:8000"
-    # live-reload while developing
+    env_file: .env
     volumes:
       - ./backend:/app
     command: uvicorn main:app --reload --host 0.0.0.0 --port 8000
@@ -18,15 +18,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: td-frontend
-    ports:
-      - "8080:8080"
     depends_on:
       - backend
+    ports:
+      - "8080:8080"
     environment:
-      # <-- this tells Vite to proxy to http://backend:8000
-      - VITE_IN_DOCKER=1
-      # Optional: fixes file watching inside Docker on macOS/Windows
-      - CHOKIDAR_USEPOLLING=true
+      VITE_IN_DOCKER: "1"
+      CHOKIDAR_USEPOLLING: "true"
     volumes:
       - .:/usr/src/app
       - /usr/src/app/node_modules

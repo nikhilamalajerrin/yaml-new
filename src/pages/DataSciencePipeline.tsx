@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useNodesState, useEdgesState, NodeChange } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import yaml from "yaml";
-import { Sparkles, Database, Settings } from "lucide-react";
+import { Sparkles, Database, Settings, Wand2, Loader2 } from "lucide-react";
 
 import { FileUpload } from "@/components/FileUpload";
 import { TableModal } from "@/components/TableModal";
@@ -13,11 +13,119 @@ import { ParameterSelector } from "@/components/ParameterSelector";
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string) || "/api";
 
-// short name for node label
+/* -------------------- helpers -------------------- */
+
 function shortName(full: string) {
   const parts = (full || "").split(".");
   return parts[parts.length - 1] || full;
 }
+
+function canonicalizeFuncName(fn: string) {
+  if (!fn) return fn;
+  return fn.replace(/^pandas\./, "").replace(/^numpy\./, "");
+}
+
+function safeParseYaml<T = any>(text: string): T {
+  try {
+    return (yaml.parse(text) as T) || ({} as T);
+  } catch {
+    return {} as T;
+  }
+}
+
+function stringifyYaml(obj: any) {
+  try {
+    return yaml.stringify(obj);
+  } catch {
+    return "nodes: {}";
+  }
+}
+
+function makeUniqueId(base: string, taken: Set<string>) {
+  if (!taken.has(base)) return base;
+  let i = 1;
+  while (taken.has(`${base}_${i}`)) i++;
+  return `${base}_${i}`;
+}
+
+function rewriteRefs(obj: any, fromId: string, toId: string) {
+  if (obj == null) return obj;
+  if (typeof obj === "string") return obj === fromId ? toId : obj;
+  if (Array.isArray(obj)) return obj.map((v) => rewriteRefs(v, fromId, toId));
+  if (typeof obj === "object") {
+    const out: any = {};
+    for (const [k, v] of Object.entries(obj)) {
+      out[k] = rewriteRefs(v, fromId, toId);
+    }
+    return out;
+  }
+  return obj;
+}
+
+function aliasReadCsvParams(params: Record<string, any> = {}) {
+  const p = { ...params };
+  if (p.filepath_or_buffer == null) {
+    for (const alt of ["filepath", "file_path", "path", "path_or_buf", "io"]) {
+      if (p[alt] != null) {
+        p.filepath_or_buffer = p[alt];
+        break;
+      }
+    }
+  }
+  return p;
+}
+
+function needsReceiver(fn: string) {
+  // Heuristic: any DataFrame.* method requires a receiver (“self”)
+  return canonicalizeFuncName(fn).startsWith("DataFrame.");
+}
+
+/** If a DataFrame.* node lacks `self`, add the most obvious one:
+ *  1) last dependency if given
+ *  2) otherwise the immediately previous node in spec order
+ */
+function autoWireReceiverForNode(
+  spec: any,
+  id: string,
+  idxInOrder: number,
+  orderedIds: string[]
+) {
+  const node = spec.nodes[id] || {};
+  const fn = canonicalizeFuncName(node.function || "");
+  node.function = fn;
+
+  if (fn === "read_csv") {
+    node.params = aliasReadCsvParams(node.params || {});
+  }
+
+  if (!needsReceiver(fn)) return;
+
+  const params = node.params || {};
+  if (params.self) return; // already wired
+
+  const deps: string[] = Array.isArray(node.dependencies) ? node.dependencies : [];
+  const candidate = deps[deps.length - 1] || orderedIds[idxInOrder - 1];
+
+  if (candidate) {
+    node.params = { ...params, self: candidate };
+    if (!deps.includes(candidate)) {
+      node.dependencies = [...deps, candidate];
+    }
+  }
+
+  // write back
+  spec.nodes[id] = node;
+}
+
+/** Normalize a YAML spec after an NL→YAML merge or manual paste. */
+function normalizeSpec(spec: any) {
+  if (!spec || !spec.nodes) return spec;
+  const ids = Object.keys(spec.nodes);
+  ids.forEach((id, i) => autoWireReceiverForNode(spec, id, i, ids));
+  return spec;
+}
+
+/* -------------------- main -------------------- */
 
 export default function DataSciencePipelinePage() {
   const [nodes, setNodes, onNodesChangeBase] = useNodesState([]);
@@ -42,6 +150,10 @@ export default function DataSciencePipelinePage() {
     params: {},
     dependencies: [],
   });
+
+  // NL → YAML prompt UI state
+  const [nlPrompt, setNlPrompt] = useState("");
+  const [genBusy, setGenBusy] = useState(false);
 
   // preload some pandas funcs (so we can auto-add read_csv)
   useEffect(() => {
@@ -84,24 +196,57 @@ export default function DataSciencePipelinePage() {
     });
   }
 
+  function openParamEditorFromYaml(nodeId: string) {
+    const spec = safeParseYaml<any>(yamlText);
+    const entry = spec?.nodes?.[nodeId];
+    if (!entry) return;
+
+    const canon = canonicalizeFuncName(entry.function);
+
+    fetch(`${API_BASE}/pandas/function/${encodeURIComponent(canon)}`)
+      .then((r) => r.json())
+      .then((funcDef) => {
+        // alias read_csv params so the modal shows values
+        const initial =
+          canon === "read_csv" ? aliasReadCsvParams(entry.params || {}) : (entry.params || {});
+        setParamModal({
+          open: true,
+          nodeId,
+          funcDef: { ...funcDef, name: canon },
+          params: initial,
+          dependencies: entry.dependencies || [],
+        });
+      })
+      .catch(() => {
+        setParamModal({
+          open: true,
+          nodeId,
+          funcDef: { name: canon, params: [] },
+          params: entry.params || {},
+          dependencies: entry.dependencies || [],
+        });
+      });
+  }
+
   function createNodeWithParams(func: any, selectedParams: Record<string, any>) {
-    const id = `${shortName(func.name)}_${nodes.length}`;
+    const id = `${shortName(func.name)}_${Object.keys(safeParseYaml<any>(yamlText).nodes || {}).length}`;
     let dependencies: string[] = [];
 
-    // if there is a previous node and this function takes df/self/left, wire it
-    if (nodes.length > 0) {
+    // wire to previous if function needs a receiver and user didn’t pick one
+    const fnCanon = canonicalizeFuncName(func.name);
+    if (needsReceiver(fnCanon) && nodes.length > 0) {
       const prev = nodes[nodes.length - 1].id;
-      const dfParam = func.params?.find((k: any) => ["df", "self", "left"].includes(k.name));
-      if (dfParam && !selectedParams[dfParam.name]) {
-        selectedParams[dfParam.name] = prev;
+      if (!selectedParams.self && !selectedParams.df && !selectedParams.left) {
+        selectedParams.self = prev;
         dependencies = [prev];
       }
     }
 
     // auto-fill filename for read_* if available
-    if (file && func.name.startsWith("read_")) {
+    if (file && fnCanon === "read_csv") {
+      selectedParams = aliasReadCsvParams(selectedParams);
       for (const k of ["filepath_or_buffer", "path_or_buf", "io", "file_path", "filepath"]) {
-        if (func.params?.some((p: any) => p.name === k) && !selectedParams[k]) {
+        if (!selectedParams[k]) {
           selectedParams[k] = file.name;
           break;
         }
@@ -119,7 +264,7 @@ export default function DataSciencePipelinePage() {
               <div className="p-1 rounded bg-primary/20">
                 <Database className="w-3 h-3 text-primary" />
               </div>
-              <span className="flex-1 truncate">{shortName(func.name)}</span>
+              <span className="flex-1 truncate">{shortName(fnCanon)}</span>
               <button
                 className="p-1 rounded bg-secondary/20 hover:bg-secondary/30"
                 onClick={(e) => {
@@ -127,7 +272,7 @@ export default function DataSciencePipelinePage() {
                   setParamModal({
                     open: true,
                     nodeId: id,
-                    funcDef: func,
+                    funcDef: { ...func, name: fnCanon },
                     params: selectedParams,
                     dependencies,
                   });
@@ -145,30 +290,66 @@ export default function DataSciencePipelinePage() {
     ]);
 
     // YAML update
-    let parsed: any;
-    try {
-      parsed = yaml.parse(yamlText) || {};
-    } catch {
-      parsed = {};
-    }
+    const parsed = safeParseYaml<any>(yamlText);
     if (!parsed.nodes) parsed.nodes = {};
-    parsed.nodes[id] = { function: func.name, params: selectedParams, dependencies };
-    setYamlText(yaml.stringify(parsed));
+    parsed.nodes[id] = { function: fnCanon, params: selectedParams, dependencies };
+    setYamlText(stringifyYaml(parsed));
   }
 
-  // --------- EDGE SYNC: explicit deps + implicit param references ----------
-  useEffect(() => {
-    let parsed: any;
-    try {
-      parsed = yaml.parse(yamlText) || {};
-    } catch {
-      parsed = {};
+  /* --------- sync visual nodes from YAML (for NL->YAML or manual edits) --------- */
+  function syncNodesFromYaml() {
+    const spec = safeParseYaml<any>(yamlText);
+    const yNodes: Record<string, any> = spec?.nodes || {};
+    const known = new Set(nodes.map((n) => n.id));
+    const toAdd: any[] = [];
+
+    let i = nodes.length;
+    for (const [id, value] of Object.entries(yNodes)) {
+      if (known.has(id)) continue;
+      const funcName = canonicalizeFuncName((value as any)?.function ?? id);
+      const label = (
+        <div className="flex items-center gap-2 px-3 py-2">
+          <div className="p-1 rounded bg-primary/20">
+            <Database className="w-3 h-3 text-primary" />
+          </div>
+          <span className="flex-1 truncate">{shortName(funcName)}</span>
+          <button
+            className="p-1 rounded bg-secondary/20 hover:bg-secondary/30"
+            onClick={(e) => {
+              e.stopPropagation();
+              openParamEditorFromYaml(id);
+            }}
+            title="Edit Parameters"
+          >
+            <Settings className="w-3 h-3 text-secondary" />
+          </button>
+        </div>
+      );
+
+      const dep = Array.isArray((value as any).dependencies) && (value as any).dependencies[0];
+      const depNode = nodes.find((n) => n.id === dep);
+      const baseX = depNode ? (depNode?.position?.x || 200) + 200 : 220 + Math.random() * 100;
+      const baseY = depNode ? depNode?.position?.y || 80 : 90 + 90 * i;
+
+      toAdd.push({
+        id,
+        data: { label },
+        position: { x: baseX, y: baseY + (i % 5) * 12 },
+        style: nodeStyle(),
+      });
+      i++;
     }
+
+    if (toAdd.length) setNodes((n) => [...n, ...toAdd]);
+  }
+
+  /* --------- EDGE SYNC ---------- */
+  useEffect(() => {
+    const parsed = safeParseYaml<any>(yamlText);
     const newEdges: any[] = [];
     const nodeMap: Record<string, any> = parsed.nodes || {};
     const nodeIds = new Set(Object.keys(nodeMap));
 
-    // helper: collect string values inside params that equal a node id (recursive)
     const collectRefs = (val: any, acc: Set<string>) => {
       if (!val) return;
       const t = typeof val;
@@ -184,53 +365,44 @@ export default function DataSciencePipelinePage() {
     if (nodeMap) {
       Object.entries(nodeMap).forEach(([id, value]: [string, any]) => {
         const edgesFrom = new Set<string>(Array.isArray(value?.dependencies) ? value.dependencies : []);
-
-        // add implicit edges from params (e.g., self: read_csv_0)
         const refs = new Set<string>();
         collectRefs(value?.params, refs);
         refs.forEach((r) => edgesFrom.add(r));
 
         edgesFrom.forEach((dep) => {
-          if (!nodeIds.has(dep)) return; // ignore non-existent
+          if (!nodeIds.has(dep)) return;
           newEdges.push({
             id: `${dep}->${id}`,
             source: dep,
             target: id,
             animated: true,
             style: { stroke: "hsl(var(--primary))", strokeWidth: 3 },
-            type: "bezier",
+            type: "smoothstep", // spline-like
           });
         });
       });
     }
     setEdges(newEdges);
+    syncNodesFromYaml();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [yamlText, nodes.length, setEdges]);
 
-  // 🔧 keep YAML in sync when nodes are removed from the canvas
+  /* 🔧 keep YAML in sync when nodes are removed */
   function onNodesChange(changes: NodeChange[]) {
-    // first apply visual changes
     onNodesChangeBase(changes);
 
     const removed = changes.filter((c) => c.type === "remove").map((c: any) => c.id);
     if (removed.length === 0) return;
 
-    let parsed: any;
-    try {
-      parsed = yaml.parse(yamlText) || {};
-    } catch {
-      parsed = {};
-    }
+    const parsed = safeParseYaml<any>(yamlText);
     if (!parsed.nodes) return;
 
     removed.forEach((id) => {
       delete parsed.nodes[id];
-
-      // remove this id from any explicit dependency lists
       Object.values(parsed.nodes).forEach((n: any) => {
         if (Array.isArray(n.dependencies)) {
           n.dependencies = n.dependencies.filter((d: string) => d !== id);
         }
-        // also scrub common receiver params if they referenced the removed node
         if (n.params) {
           ["self", "df", "left", "right"].forEach((k) => {
             if (n.params[k] === id) delete n.params[k];
@@ -239,10 +411,10 @@ export default function DataSciencePipelinePage() {
       });
     });
 
-    setYamlText(yaml.stringify(parsed));
+    setYamlText(stringifyYaml(parsed));
   }
 
-  // 👉 double-click: ask backend to execute YAML up to this node and return preview
+  /* 👉 double-click: preview */
   async function handleNodeDoubleClick(e: any, node: any) {
     e?.stopPropagation?.();
 
@@ -255,32 +427,27 @@ export default function DataSciencePipelinePage() {
       const res = await fetch(`${API_BASE}/pipeline/run`, { method: "POST", body: fd });
 
       if (!res.ok) {
-        // pull as much detail as possible
-        let bodyText = "";
+        // If it's the classic "requires 'self'" complaint, open the editor so user can pick input
+        let detail = "";
         try {
           const ct = res.headers.get("content-type") || "";
           if (ct.includes("application/json")) {
             const j = await res.json();
-            const detail =
-              j?.detail ??
-              j?.error ??
-              j?.message ??
-              (Array.isArray(j) && j[0]?.msg) ??
-              "";
-            const tb = j?.traceback ?? j?.stack ?? "";
-            bodyText = [detail, tb].filter(Boolean).join("\n\n");
+            detail = j?.detail || "";
           } else {
-            bodyText = await res.text();
+            detail = await res.text();
           }
-        } catch {
-          try { bodyText = await res.text(); } catch { bodyText = ""; }
+        } catch {}
+
+        if ((detail || "").includes("requires 'self'")) {
+          openParamEditorFromYaml(node.id);
         }
-        const msg = `HTTP ${res.status} while previewing "${node?.id}":\n` +
-                    (bodyText ? bodyText.slice(0, 2000) : "(no response body)");
+
+        const msg = `HTTP ${res.status} while previewing "${node?.id}":\n` + (detail || "(no response body)");
         throw new Error(msg);
       }
 
-      const data = await res.json(); // { columns: [...], rows: [...] }
+      const data = await res.json();
       setTableModal({
         open: true,
         table: {
@@ -294,7 +461,6 @@ export default function DataSciencePipelinePage() {
     }
   }
 
-  // used by YamlEditor "Run" button (demo: run the last node preview)
   async function runPipeline() {
     if (nodes.length === 0) {
       alert("Add at least one node first.");
@@ -307,23 +473,23 @@ export default function DataSciencePipelinePage() {
     const { nodeId, funcDef, dependencies } = paramModal;
 
     if (!nodeId) {
-      // creating a new node
       createNodeWithParams(funcDef, newParams);
     } else {
-      // updating existing YAML
-      let parsed: any;
-      try {
-        parsed = yaml.parse(yamlText) || {};
-      } catch {
-        parsed = {};
-      }
+      const parsed = safeParseYaml<any>(yamlText);
       if (!parsed.nodes) parsed.nodes = {};
+
+      // write normalized function name
+      const fnCanon = canonicalizeFuncName(funcDef.name);
       parsed.nodes[nodeId] = {
-        function: funcDef.name,
-        params: newParams,
+        function: fnCanon,
+        params: fnCanon === "read_csv" ? aliasReadCsvParams(newParams) : newParams,
         dependencies: dependencies || [],
       };
-      setYamlText(yaml.stringify(parsed));
+
+      // Normalize (auto-wire) the spec so preview doesn’t fail
+      normalizeSpec(parsed);
+
+      setYamlText(stringifyYaml(parsed));
     }
 
     setParamModal({
@@ -333,6 +499,77 @@ export default function DataSciencePipelinePage() {
       params: {},
       dependencies: [],
     });
+  }
+
+  /* --------- NL → YAML (generate & merge, then normalize) ---------- */
+  async function generateFromPrompt() {
+    if (!nlPrompt.trim()) return;
+    setGenBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("prompt", nlPrompt);
+      fd.append("yaml", yamlText);   // backend expects 'yaml'
+      fd.append("mode", "append");
+
+      const res = await fetch(`${API_BASE}/nl2yaml`, { method: "POST", body: fd });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`NL2YAML HTTP ${res.status}: ${txt.slice(0, 400)}`);
+      }
+      const data = await res.json(); // { yaml, spec, mode }
+      const addSpec = data?.spec || safeParseYaml<any>(data?.yaml || "");
+
+      const cur = safeParseYaml<any>(yamlText);
+      if (!cur.nodes) cur.nodes = {};
+      const taken = new Set(Object.keys(cur.nodes));
+      const newNodes: Record<string, any> = (addSpec?.nodes || {}) as Record<string, any>;
+
+      // resolve id collisions
+      const renameMap = new Map<string, string>();
+      for (const id of Object.keys(newNodes)) {
+        if (taken.has(id)) {
+          const uid = makeUniqueId(id, taken);
+          renameMap.set(id, uid);
+          taken.add(uid);
+        } else {
+          taken.add(id);
+        }
+      }
+
+      const patched: Record<string, any> = {};
+      for (const [id, node] of Object.entries(newNodes)) {
+        const newId = renameMap.get(id) || id;
+        const deps = Array.isArray((node as any).dependencies) ? (node as any).dependencies : [];
+        const params = (node as any).params || {};
+
+        const deps2 = deps.map((d: string) => renameMap.get(d) || d);
+
+        let params2 = rewriteRefs(params, id, newId);
+        for (const [oldId, newOne] of renameMap.entries()) {
+          if (oldId !== id) params2 = rewriteRefs(params2, oldId, newOne);
+        }
+
+        patched[newId] = {
+          ...node,
+          function: canonicalizeFuncName((node as any).function || ""),
+          dependencies: deps2,
+          params: patched[newId]?.function === "read_csv" ? aliasReadCsvParams(params2) : params2,
+        };
+      }
+
+      // merge then normalize (auto-wire receivers if missing)
+      const mergedSpec = { nodes: { ...cur.nodes, ...patched } };
+      normalizeSpec(mergedSpec);
+
+      const merged = stringifyYaml(mergedSpec);
+      setYamlText(merged);
+      setNlPrompt("");
+    } catch (e: any) {
+      console.error(e);
+      alert(String(e?.message || e));
+    } finally {
+      setGenBusy(false);
+    }
   }
 
   return (
@@ -355,11 +592,39 @@ export default function DataSciencePipelinePage() {
 
           <div className="pipeline-panel flex flex-col">
             <div className="p-6 border-b border-border/50">
-              <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
-                <FileUpload onFileSelected={setFile} selectedFile={file} />
-                <FunctionSearch onSelectFunction={addFunctionNode} />
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
+                  <FileUpload onFileSelected={setFile} selectedFile={file} />
+                  <FunctionSearch onSelectFunction={addFunctionNode} />
+                </div>
+
+                {/* NL → YAML prompt bar */}
+                <div className="flex items-stretch gap-2">
+                  <div className="relative flex-1">
+                    <Wand2 className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                    <input
+                      className="pipeline-input pl-9 w-full"
+                      placeholder='e.g., "Load check.csv, rename REDHILLS -> RED, select rows 1:10"'
+                      value={nlPrompt}
+                      onChange={(e) => setNlPrompt(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") generateFromPrompt();
+                      }}
+                    />
+                  </div>
+                  <button
+                    onClick={generateFromPrompt}
+                    disabled={genBusy || !nlPrompt.trim()}
+                    className="pipeline-button flex items-center gap-2 disabled:opacity-60"
+                    title="Let AI generate/append YAML steps"
+                  >
+                    {genBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+                    Generate
+                  </button>
+                </div>
               </div>
             </div>
+
             <div className="flex-1 p-6">
               <PipelineFlow
                 nodes={nodes}
@@ -374,6 +639,7 @@ export default function DataSciencePipelinePage() {
       </div>
 
       <ParameterSelector
+        key={paramModal.nodeId || "new"}
         open={paramModal.open}
         onClose={() => setParamModal({ ...paramModal, open: false })}
         funcDef={paramModal.funcDef}

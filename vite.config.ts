@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import { componentTagger } from "lovable-tagger";
 
-// We’ll flip the proxy target based on an env var that we set only in Docker.
+// In Docker we set VITE_IN_DOCKER=1 via docker-compose.yml
 const inDocker = process.env.VITE_IN_DOCKER === "1";
 
 export default defineConfig(({ mode }) => ({
@@ -13,10 +13,10 @@ export default defineConfig(({ mode }) => ({
     port: 8080,
     proxy: {
       "/api": {
-        // Local dev -> 127.0.0.1, Docker -> backend service name
+        // Docker: talk to FastAPI service name "backend"; local: 127.0.0.1
         target: inDocker ? "http://backend:8000" : "http://127.0.0.1:8000",
         changeOrigin: true,
-        rewrite: (p) => p.replace(/^\/api/, ""),
+        rewrite: (p) => p.replace(/^\/api/, ""), // frontend calls /api/healthz -> backend /healthz
       },
     },
   },

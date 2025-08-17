@@ -1,25 +1,29 @@
 """
-Tharavu Dappa Backend — Light index + Robust pipeline executor
+Tharavu Dappa Backend — Light index + Robust pipeline executor + NL→YAML
 - /pandas/search + /pandas/suggest include synthetic DataFrame.iloc / DataFrame.loc
 - /pipeline/run executes pipelines with param coercion & reference resolution
 - Special handling for .iloc / .loc accepts Python-like slice text (1:10, :, 0:2, lists…)
+- /nl2yaml converts natural language to YAML (OpenRouter DeepSeek or heuristic fallback)
 """
 
+import os
+import re
+import json
 import inspect
 import importlib
-import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Set
 
+import requests
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import yaml
+import yaml as pyyaml
 from io import BytesIO
 
-app = FastAPI(title="Tharavu Dappa Backend", version="3.3.0")
+app = FastAPI(title="Tharavu Dappa Backend", version="3.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------- utils --------------------
+# ======================== Utilities ========================
 
 def _callable(x) -> bool:
     try:
@@ -74,7 +78,6 @@ def _add(functions: List[Dict[str, Any]], names: Set[str],
 def _add_synthetic(functions: List[Dict[str, Any]], names: Set[str],
                    canonical: str, doc: str, params: List[Dict[str, Any]],
                    library="pandas", category="DataFrame"):
-    """Inject non-callable helpers like DataFrame.iloc / DataFrame.loc into index."""
     info = {
         "name": canonical,
         "doc": doc,
@@ -84,7 +87,6 @@ def _add_synthetic(functions: List[Dict[str, Any]], names: Set[str],
         "category": category,
     }
     functions.append(info)
-    # add both short and namespaced names into suggestions
     short = canonical.split(".")[-1]
     names.add(short)
     names.add(canonical)
@@ -119,7 +121,7 @@ def _collect_light() -> Tuple[List[Dict[str, Any]], List[str]]:
                 _add(functions, suggestions, meth, m, "pandas", cls_name, f"{cls_name}.{m}")
                 suggestions.add(f"{cls_name}.{m}")
 
-    # add synthetic indexers (not callables; helpful for search & details)
+    # synthetic indexers for search
     _add_synthetic(
         functions, suggestions,
         "DataFrame.iloc",
@@ -157,7 +159,7 @@ def _collect_light() -> Tuple[List[Dict[str, Any]], List[str]]:
         except Exception:
             pass
 
-    # numpy top-level
+    # numpy top-level + light submodules
     for a in dir(np):
         if a.startswith("_"): continue
         try:
@@ -166,8 +168,6 @@ def _collect_light() -> Tuple[List[Dict[str, Any]], List[str]]:
             continue
         if _callable(obj):
             _add(functions, suggestions, obj, a, "numpy", "NumPy", a)
-
-    # numpy submodules (light)
     for sub in ("linalg", "random", "fft"):
         try:
             submod = getattr(np, sub)
@@ -195,7 +195,7 @@ def _collect_light() -> Tuple[List[Dict[str, Any]], List[str]]:
 def get_index() -> Tuple[List[Dict[str, Any]], List[str]]:
     return _collect_light()
 
-# -------------------- function resolution --------------------
+# ======================== Function resolution ========================
 
 def get_callable_from_name(func_name: str):
     """Resolve a pandas/numpy function or pandas method by canonical/name."""
@@ -260,7 +260,7 @@ def get_callable_from_name(func_name: str):
 
     raise ValueError(f"Function '{func_name}' not found")
 
-# -------------------- param coercion & indexer parsing --------------------
+# ======================== Param coercion & indexer parsing ========================
 
 _slice_re = re.compile(r"^\s*-?\d*\s*:\s*-?\d*(\s*:\s*-?\d*)?\s*$")  # 1:10, :10, 1:, 1:10:2, :
 
@@ -277,7 +277,7 @@ def _looks_like_list_str(s: str) -> bool:
 
 def _try_yaml_or_json_scalar(s: str) -> Any:
     try:
-        return yaml.safe_load(s)
+        return pyyaml.safe_load(s)
     except Exception:
         return s
 
@@ -361,7 +361,7 @@ def _normalize_indexer(v: Any, *, iloc: bool):
         if _slice_re.match(s):
             return _parse_slice_like_text(s)
         if s.startswith("[") and s.endswith("]"):
-            arr = yaml.safe_load(s)
+            arr = pyyaml.safe_load(s)
             return [int(x) for x in arr] if iloc else arr
         if "," in s:
             parts = [p.strip() for p in s.split(",") if p.strip() != ""]
@@ -372,16 +372,52 @@ def _normalize_indexer(v: Any, *, iloc: bool):
             return s
     return v
 
-# -------------------- pipeline executor --------------------
+# ======================== IO param normalization ========================
+
+READ_ARG_ALIASES = {
+    "filepath": "filepath_or_buffer",
+    "file_path": "filepath_or_buffer",
+    "path": "filepath_or_buffer",
+    "path_or_buf": "filepath_or_buffer",
+    "io": "filepath_or_buffer",
+}
+
+def is_read_function(func_name: str) -> bool:
+    if not func_name:
+        return False
+    fn = func_name.split(".")[-1]
+    return fn.startswith("read_") or fn in {
+        "read_csv", "read_json", "read_excel", "read_parquet", "read_feather",
+        "read_pickle", "read_html", "read_xml", "read_table"
+    }
+
+def normalize_read_params(func_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(params, dict) or not is_read_function(func_name):
+        return params
+    p = dict(params)
+    if "filepath_or_buffer" not in p:
+        for k in list(p.keys()):
+            if k in READ_ARG_ALIASES:
+                p["filepath_or_buffer"] = p.pop(k)
+                break
+    return p
+
+# ======================== Pipeline executor ========================
 
 @app.post("/pipeline/run")
 async def pipeline_run(
-    yaml: str = Form(...),
+    # Accept BOTH names to be backward-compatible with the frontend
+    yaml_text: Optional[str] = Form(None),
+    yaml: Optional[str] = Form(None),
     preview_node: Optional[str] = Form(None),
     file: Optional[UploadFile] = None,
 ):
+    raw_yaml = yaml_text if yaml_text is not None else yaml
+    if not raw_yaml:
+        raise HTTPException(status_code=400, detail="Missing 'yaml' string")
+
     try:
-        spec = yaml and __import__("yaml").safe_load(yaml) or {}
+        spec = pyyaml.safe_load(raw_yaml) or {}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 
@@ -403,6 +439,9 @@ async def pipeline_run(
             raw_params = dict(node_def.get("params", {}))
             deps = list(node_def.get("dependencies", []))
 
+            # unify IO params early so pandas won't complain
+            raw_params = normalize_read_params(func_name, raw_params)
+
             # recognize indexers
             is_indexer = func_name in ("DataFrame.iloc", "DataFrame.loc")
 
@@ -422,16 +461,16 @@ async def pipeline_run(
                 k = raw_params["df"]
                 recv = executed.get(k) if isinstance(k, str) else k
                 raw_params.pop("df", None)
-            elif "left" in raw_params and func_name.endswith(".merge"):
+            elif "left" in raw_params and func_name and func_name.endswith(".merge"):
                 k = raw_params["left"]
                 recv = executed.get(k) if isinstance(k, str) else k
                 raw_params.pop("left", None)
 
-            # read_* auto: feed uploaded file bytes
-            if uploaded_bytes is not None and func_name.startswith("read_"):
-                for k in ["filepath_or_buffer", "path_or_buf", "io", "file_path", "filepath"]:
-                    if k in raw_params:
-                        raw_params[k] = BytesIO(uploaded_bytes)
+            # read_* auto: feed uploaded file bytes (using canonical key)
+            if uploaded_bytes is not None and is_read_function(func_name or ""):
+                # ensure canonical key exists then override with BytesIO
+                raw_params = normalize_read_params(func_name, raw_params)
+                raw_params["filepath_or_buffer"] = BytesIO(uploaded_bytes)
 
             try:
                 if is_indexer:
@@ -476,11 +515,10 @@ async def pipeline_run(
         if not made_progress:
             raise HTTPException(status_code=400, detail="Pipeline has cyclic or unsatisfied dependencies.")
 
-    # No preview requested → return last
     last_key = list(executed.keys())[-1]
     return serialize_result(executed[last_key])
 
-# -------------------- result serialization --------------------
+# ======================== Result serialization ========================
 
 def serialize_result(result: Any):
     if isinstance(result, pd.DataFrame):
@@ -491,7 +529,7 @@ def serialize_result(result: Any):
         return {"columns": ["value"], "rows": [[str(v)] for v in result.flatten()]}
     return {"columns": ["value"], "rows": [[str(result)]]}
 
-# -------------------- search & details --------------------
+# ======================== Search & details ========================
 
 @app.get("/")
 async def root():
@@ -543,7 +581,6 @@ async def search(query: str):
 
 @app.get("/pandas/function/{function_name}")
 async def function_details(function_name: str):
-    # synthetic details for indexers
     if function_name in ("DataFrame.iloc", "DataFrame.loc", "iloc", "loc"):
         canonical = "DataFrame.iloc" if "iloc" in function_name else "DataFrame.loc"
         doc = "Integer-location based indexer." if canonical.endswith("iloc") else "Label-based indexer."
@@ -559,18 +596,162 @@ async def function_details(function_name: str):
             "library": "pandas",
         }
 
-    # otherwise resolve normally
     try:
         func = get_callable_from_name(function_name)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
-    if func is None:  # shouldn't happen now
+    if func is None:
         raise HTTPException(status_code=404, detail=f"Function '{function_name}' not found")
     info = get_function_signature(func)
     info["library"] = "pandas" if (info.get("module","").startswith("pandas")) else "numpy"
     return info
 
-# -------------------- main --------------------
+# ======================== NL → YAML ========================
+
+_YAML_FENCE_RE = re.compile(r"```(?:yaml|yml)?\s*([\s\S]*?)```", re.IGNORECASE)
+_YAML_DASH_RE  = re.compile(r"---\s*\n([\s\S]*?)\n(?:---|\Z)")
+
+def _extract_yaml_block(text: str):
+    for block in _YAML_FENCE_RE.findall(text or ""):
+        try:
+            spec = pyyaml.safe_load(block)
+            if isinstance(spec, dict) and "nodes" in spec:
+                return pyyaml.safe_dump(spec, sort_keys=False), spec
+        except Exception:
+            pass
+    for block in _YAML_DASH_RE.findall(text or ""):
+        try:
+            spec = pyyaml.safe_load(block)
+            if isinstance(spec, dict) and "nodes" in spec:
+                return pyyaml.safe_dump(spec, sort_keys=False), spec
+        except Exception:
+            pass
+    try:
+        spec = pyyaml.safe_load(text)
+        if isinstance(spec, dict) and "nodes" in spec:
+            return pyyaml.safe_dump(spec, sort_keys=False), spec
+    except Exception:
+        pass
+    return None, None
+
+def _heuristic_nl_to_yaml(prompt: str) -> Optional[Dict[str, Any]]:
+    p = (prompt or "").lower()
+    if "read" in p and ".csv" in p:
+        m = re.search(r"([A-Za-z0-9_\-\.]+\.csv)", prompt)
+        fname = m.group(1) if m else "data.csv"
+        return {
+            "nodes": {
+                "read_csv_0": {
+                    "function": "read_csv",
+                    "params": {"filepath_or_buffer": fname},
+                    "dependencies": [],
+                }
+            }
+        }
+    return None
+
+@app.post("/nl2yaml")
+async def nl2yaml(
+    prompt: str = Form(...),
+    current_yaml: str = Form("nodes: {}"),
+    mode: str = Form("append"),
+):
+    try:
+        _ = pyyaml.safe_load(current_yaml) or {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid current_yaml: {e}")
+
+    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    ds_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+
+    if not or_key and not ds_key:
+        spec = _heuristic_nl_to_yaml(prompt)
+        if not spec:
+            raise HTTPException(status_code=400, detail="Heuristic NL→YAML couldn't understand the request. Configure OPENROUTER_API_KEY or DEEPSEEK_API_KEY for LLM mode.")
+        return {"yaml": pyyaml.safe_dump(spec, sort_keys=False), "spec": spec, "mode": mode}
+
+    guideline = (
+        "Return ONLY YAML for a pipeline with this schema:\n"
+        "nodes:\n"
+        "  <id>:\n"
+        "    function: <function id>\n"
+        "    params: <dict>\n"
+        "    dependencies: <list>\n\n"
+        "- Use ids like read_csv_0, rename_1, iloc_2.\n"
+        "- Use canonical ids: read_csv, DataFrame.rename, DataFrame.iloc, DataFrame.loc, merge, etc. Do NOT prefix with 'pandas.'.\n"
+        "- Do not assume any default input. If a DataFrame.* method needs an input, you MUST set self: <some_node_id> explicitly.\n"
+        "- For iloc/loc use rows/cols with Python-like slices (e.g., rows: 1:10, cols: \":\" or 0:2).\n"
+        "- No prose, no fences — YAML only."
+    )
+    user_msg = f"CURRENT YAML:\n{current_yaml}\n\nREQUEST:\n{prompt}\n\n{guideline}"
+
+    text = None
+    try:
+        if or_key:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1-0528:free")
+            headers = {
+                "Authorization": f"Bearer {or_key}",
+                "Content-Type": "application/json",
+            }
+            site_url = os.getenv("OPENROUTER_SITE_URL", "")
+            site_name = os.getenv("OPENROUTER_SITE_NAME", "")
+            if site_url: headers["HTTP-Referer"] = site_url
+            if site_name: headers["X-Title"] = site_name
+
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You convert user requests into YAML pipeline specs. Output YAML only."},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.2,
+            }
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            if r.status_code == 401: raise HTTPException(status_code=401, detail=f"OpenRouter auth error: {r.text}")
+            if r.status_code >= 400: raise HTTPException(status_code=r.status_code, detail=f"OpenRouter error: {r.text}")
+            obj = r.json()
+            text = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+            headers = {
+                "Authorization": f"Bearer {ds_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You convert user requests into YAML pipeline specs. Output YAML only."},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.2,
+            }
+            r = requests.post(f"{url}/chat/completions", headers=headers, data=json.dumps(payload), timeout=60)
+            if r.status_code == 401: raise HTTPException(status_code=401, detail=f"DeepSeek error: {r.text}")
+            if r.status_code >= 400: raise HTTPException(status_code=r.status_code, detail=f"DeepSeek error: {r.text}")
+            obj = r.json()
+            text = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {e}")
+
+    yaml_out, spec = _extract_yaml_block(text or "")
+    if not spec:
+        raise HTTPException(status_code=502, detail=f"Model did not return valid YAML.\n---\n{text}\n---")
+
+    # normalize read param names in the returned spec, too
+    if isinstance(spec, dict) and "nodes" in spec:
+        for nid, node in (spec.get("nodes") or {}).items():
+            fn = node.get("function")
+            node["params"] = normalize_read_params(fn, node.get("params") or {})
+            spec["nodes"][nid] = node
+
+    return {"yaml": yaml_out, "spec": spec, "mode": mode}
+
+# ======================== Main ========================
 
 if __name__ == "__main__":
+    # Run with: uvicorn main:app --reload --host 0.0.0.0 --port 8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
