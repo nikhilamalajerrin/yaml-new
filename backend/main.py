@@ -653,102 +653,227 @@ def _heuristic_nl_to_yaml(prompt: str) -> Optional[Dict[str, Any]]:
 @app.post("/nl2yaml")
 async def nl2yaml(
     prompt: str = Form(...),
-    current_yaml: str = Form("nodes: {}"),
+    # accept all aliases from various frontends
+    yaml_text: Optional[str] = Form(None),
+    yaml: Optional[str] = Form(None),
+    current_yaml: Optional[str] = Form(None),
     mode: str = Form("append"),
+    receiver: Optional[str] = Form(None),
 ):
-    try:
-        _ = pyyaml.safe_load(current_yaml) or {}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid current_yaml: {e}")
+    # pick whichever YAML field we got
+    cur_yaml = (
+        yaml_text if yaml_text is not None
+        else (yaml if yaml is not None
+              else (current_yaml if current_yaml is not None else "nodes: {}"))
+    )
 
+    try:
+        cur_spec = pyyaml.safe_load(cur_yaml) or {}
+        if not isinstance(cur_spec, dict): cur_spec = {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid current YAML: {e}")
+
+    cur_nodes: Dict[str, Any] = dict(cur_spec.get("nodes") or {})
+    ordered = list(cur_nodes.keys())
+    last_id = ordered[-1] if ordered else None
+    recv = receiver or last_id  # we’ll prefer the user-sent receiver, else last node
+
+    # env
     or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     ds_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
-    if not or_key and not ds_key:
-        spec = _heuristic_nl_to_yaml(prompt)
-        if not spec:
-            raise HTTPException(status_code=400, detail="Heuristic NL→YAML couldn't understand the request. Configure OPENROUTER_API_KEY or DEEPSEEK_API_KEY for LLM mode.")
-        return {"yaml": pyyaml.safe_dump(spec, sort_keys=False), "spec": spec, "mode": mode}
+    # -------- helpers used below ---------------------------------------------
 
-    guideline = (
-        "Return ONLY YAML for a pipeline with this schema:\n"
-        "nodes:\n"
-        "  <id>:\n"
-        "    function: <function id>\n"
-        "    params: <dict>\n"
-        "    dependencies: <list>\n\n"
-        "- Use ids like read_csv_0, rename_1, iloc_2.\n"
-        "- Use canonical ids: read_csv, DataFrame.rename, DataFrame.iloc, DataFrame.loc, merge, etc. Do NOT prefix with 'pandas.'.\n"
-        "- Do not assume any default input. If a DataFrame.* method needs an input, you MUST set self: <some_node_id> explicitly.\n"
-        "- For iloc/loc use rows/cols with Python-like slices (e.g., rows: 1:10, cols: \":\" or 0:2).\n"
-        "- No prose, no fences — YAML only."
-    )
-    user_msg = f"CURRENT YAML:\n{current_yaml}\n\nREQUEST:\n{prompt}\n\n{guideline}"
-
-    text = None
-    try:
-        if or_key:
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1-0528:free")
-            headers = {
-                "Authorization": f"Bearer {or_key}",
-                "Content-Type": "application/json",
+    def _canonicalize(spec: Dict[str, Any]) -> Dict[str, Any]:
+        READ_PARAM_ALIASES = {
+            "filepath": "filepath_or_buffer",
+            "file_path": "filepath_or_buffer",
+            "path": "filepath_or_buffer",
+            "path_or_buf": "filepath_or_buffer",
+            "io": "filepath_or_buffer",
+        }
+        def is_read(fn: Optional[str]) -> bool:
+            if not fn: return False
+            base = fn.split(".")[-1]
+            return base.startswith("read_") or base in {
+                "read_csv","read_json","read_excel","read_parquet","read_feather",
+                "read_pickle","read_html","read_xml","read_table"
             }
-            site_url = os.getenv("OPENROUTER_SITE_URL", "")
-            site_name = os.getenv("OPENROUTER_SITE_NAME", "")
-            if site_url: headers["HTTP-Referer"] = site_url
-            if site_name: headers["X-Title"] = site_name
+        out = {"nodes": {}}
+        for nid, node in (spec.get("nodes") or {}).items():
+            node = dict(node or {})
+            fn = node.get("function")
+            if isinstance(fn, str):
+                if fn.startswith("pandas."): fn = fn[7:]
+                if fn.startswith("numpy."):  fn = fn[6:]
+                if fn.endswith(".rename") and not fn.startswith("DataFrame."): fn = "DataFrame.rename"
+                if fn.endswith(".iloc")   and not fn.startswith("DataFrame."): fn = "DataFrame.iloc"
+                if fn.endswith(".loc")    and not fn.startswith("DataFrame."): fn = "DataFrame.loc"
+            params = dict(node.get("params") or {})
+            if is_read(fn) and "filepath_or_buffer" not in params:
+                for k in list(params.keys()):
+                    if k in READ_PARAM_ALIASES:
+                        params["filepath_or_buffer"] = params.pop(k); break
+            node["function"] = fn
+            node["params"] = params
+            out["nodes"][nid] = node
+        return out
 
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You convert user requests into YAML pipeline specs. Output YAML only."},
-                    {"role": "user", "content": user_msg},
-                ],
-                "temperature": 0.2,
-            }
-            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-            if r.status_code == 401: raise HTTPException(status_code=401, detail=f"OpenRouter auth error: {r.text}")
-            if r.status_code >= 400: raise HTTPException(status_code=r.status_code, detail=f"OpenRouter error: {r.text}")
-            obj = r.json()
-            text = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-        else:
-            url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-            model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-            headers = {
-                "Authorization": f"Bearer {ds_key}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You convert user requests into YAML pipeline specs. Output YAML only."},
-                    {"role": "user", "content": user_msg},
-                ],
-                "temperature": 0.2,
-            }
-            r = requests.post(f"{url}/chat/completions", headers=headers, data=json.dumps(payload), timeout=60)
-            if r.status_code == 401: raise HTTPException(status_code=401, detail=f"DeepSeek error: {r.text}")
-            if r.status_code >= 400: raise HTTPException(status_code=r.status_code, detail=f"DeepSeek error: {r.text}")
-            obj = r.json()
-            text = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {e}")
+    def _rewrite(o, old_id, new_id):
+        if isinstance(o, str): return new_id if o == old_id else o
+        if isinstance(o, list): return [_rewrite(x, old_id, new_id) for x in o]
+        if isinstance(o, dict): return {k: _rewrite(v, old_id, new_id) for k, v in o.items()}
+        return o
 
-    yaml_out, spec = _extract_yaml_block(text or "")
-    if not spec:
-        raise HTTPException(status_code=502, detail=f"Model did not return valid YAML.\n---\n{text}\n---")
+    def _inject_receiver(spec: Dict[str, Any], recv_id: Optional[str]) -> Dict[str, Any]:
+        if not recv_id: return spec
+        out = {"nodes": {}}
+        for nid, node in (spec.get("nodes") or {}).items():
+            node = dict(node or {})
+            fn = node.get("function")
+            params = dict(node.get("params") or {})
+            deps = list(node.get("dependencies") or [])
+            needs_self = isinstance(fn, str) and (fn.startswith("DataFrame.") or fn in ("DataFrame.iloc","DataFrame.loc"))
+            has_self  = any(k in params for k in ("self","df","left"))
+            if needs_self:
+                # If no valid self or self points to a node NOT in the current graph,
+                # force it to continue from recv_id.
+                sref = params.get("self") or params.get("df") or params.get("left")
+                if (not has_self) or (isinstance(sref, str) and sref not in cur_nodes):
+                    params["self"] = recv_id
+                    if recv_id not in deps: deps.append(recv_id)
+            node["params"] = params
+            node["dependencies"] = deps
+            out["nodes"][nid] = node
+        return out
 
-    # normalize read param names in the returned spec, too
-    if isinstance(spec, dict) and "nodes" in spec:
+    def _dedupe_receiver_clone(spec: Dict[str, Any], recv_id: Optional[str]) -> Dict[str, Any]:
+        """If the model recreated the receiver step (same function+params minus self),
+           drop the clone and rewrite all refs to the original receiver."""
+        if not recv_id: return spec
+        recv_node = cur_nodes.get(recv_id)
+        if not isinstance(recv_node, dict): return spec
+
+        base_fn = recv_node.get("function")
+        base_params = dict(recv_node.get("params") or {})
+        base_params_no_self = {k: v for k, v in base_params.items() if k != "self"}
+
+        drop_ids = []
         for nid, node in (spec.get("nodes") or {}).items():
             fn = node.get("function")
-            node["params"] = normalize_read_params(fn, node.get("params") or {})
-            spec["nodes"][nid] = node
+            params = dict(node.get("params") or {})
+            params_no_self = {k: v for k, v in params.items() if k != "self"}
+            if fn == base_fn and params_no_self == base_params_no_self:
+                drop_ids.append(nid)
 
-    return {"yaml": yaml_out, "spec": spec, "mode": mode}
+        if not drop_ids:
+            return spec
+
+        # rewrite all references to the dropped nodes → recv_id, then delete them
+        patched = {"nodes": {}}
+        for nid, node in (spec.get("nodes") or {}).items():
+            if nid in drop_ids:
+                continue
+            node = dict(node or {})
+            node["params"] = node.get("params") or {}
+            for did in drop_ids:
+                node["params"] = _rewrite(node["params"], did, recv_id)
+                node["dependencies"] = list(_rewrite(node.get("dependencies") or [], did, recv_id))
+            patched["nodes"][nid] = node
+        return patched
+
+    # -------- heuristic path (no keys) ----------------------------------------
+    def _heuristic(prompt_text: str) -> Optional[Dict[str, Any]]:
+        p = (prompt_text or "").lower()
+        if "read" in p and ".csv" in p:
+            m = re.search(r"([A-Za-z0-9_\-\.]+\.csv)", prompt_text)
+            fname = m.group(1) if m else "data.csv"
+            return {"nodes": {"read_csv_0": {"function":"read_csv","params":{"filepath_or_buffer": fname},"dependencies":[]}}}
+        if "row" in p or "column" in p or "iloc" in p or "slice" in p:
+            # very light iloc guess
+            return {"nodes": {"iloc_0": {"function":"DataFrame.iloc","params":{"rows":"0:5","cols":"0:3"},"dependencies":[recv] if recv else []}}}
+        return None
+
+    # -------- build instruction & call model ----------------------------------
+    guideline = [
+        "Return ONLY YAML for a pipeline with this schema:",
+        "nodes:",
+        "  <id>:",
+        "    function: <function id>",
+        "    params: <dict>",
+        "    dependencies: <list>",
+        "",
+        "- Use ids like read_csv_0, rename_1, iloc_2.",
+        "- Use canonical ids: read_csv, DataFrame.rename, DataFrame.iloc, DataFrame.loc, merge, etc. Do NOT prefix with 'pandas.'.",
+        "- Do not assume any default input.",
+        "- Do NOT recreate or duplicate steps that already exist; only add the new steps requested.",
+    ]
+    if recv:
+        guideline.append(f"- Continue from the existing node {recv}. For any DataFrame.* operation, set `self: {recv}` and depend on {recv}, unless the user explicitly names a different input.")
+    guideline.append('- For iloc/loc use rows/cols with Python-like slices (e.g., rows: 1:10, cols: ":" or 0:2).')
+    guideline.append("- No prose, no fences — YAML only.")
+    guideline_text = "\n".join(guideline)
+
+    user_msg = f"CURRENT YAML:\n{cur_yaml}\n\nREQUEST:\n{prompt}\n\n{guideline_text}"
+
+    text = None
+    if not or_key and not ds_key:
+        # heuristic only
+        spec = _heuristic(prompt)
+        if not spec:
+            raise HTTPException(status_code=400, detail="Heuristic NL→YAML couldn't understand the request. Configure OPENROUTER_API_KEY or DEEPSEEK_API_KEY for LLM mode.")
+    else:
+        try:
+            if or_key:
+                url = os.getenv("OPENROUTER_BASE_URL","https://openrouter.ai/api/v1").rstrip("/") + "/chat/completions"
+                model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1-0528:free")
+                headers = {"Authorization": f"Bearer {or_key}", "Content-Type": "application/json"}
+                site_url = os.getenv("OPENROUTER_SITE_URL", ""); site_name = os.getenv("OPENROUTER_SITE_NAME","")
+                if site_url: headers["HTTP-Referer"] = site_url
+                if site_name: headers["X-Title"] = site_name
+                payload = {"model": model, "messages":[
+                    {"role":"system","content":"You convert user requests into YAML pipeline specs. Output YAML only."},
+                    {"role":"user","content": user_msg},
+                ], "temperature": 0.2}
+                r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+                if r.status_code == 401: raise HTTPException(status_code=401, detail=f"OpenRouter auth error: {r.text}")
+                if r.status_code >= 400: raise HTTPException(status_code=r.status_code, detail=f"OpenRouter error: {r.text}")
+                text = r.json().get("choices",[{}])[0].get("message",{}).get("content","")
+            else:
+                url = os.getenv("DEEPSEEK_BASE_URL","https://api.deepseek.com").rstrip("/") + "/chat/completions"
+                model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+                headers = {"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"}
+                payload = {"model": model, "messages":[
+                    {"role":"system","content":"You convert user requests into YAML pipeline specs. Output YAML only."},
+                    {"role":"user","content": user_msg},
+                ], "temperature": 0.2}
+                r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+                if r.status_code == 401: raise HTTPException(status_code=401, detail=f"DeepSeek error: {r.text}")
+                if r.status_code >= 400: raise HTTPException(status_code=r.status_code, detail=f"DeepSeek error: {r.text}")
+                text = r.json().get("choices",[{}])[0].get("message",{}).get("content","")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"LLM request failed: {e}")
+
+        yaml_out, spec = _extract_yaml_block(text or "")
+        if not spec:
+            raise HTTPException(status_code=502, detail=f"Model did not return valid YAML.\n---\n{text}\n---")
+
+    # post-process: canonicalize → inject receiver → drop duplicate of receiver
+    spec = _canonicalize(spec)
+    spec = _inject_receiver(spec, recv)
+    spec = _dedupe_receiver_clone(spec, recv)
+
+    # also normalize read_* param names
+    for nid, node in list((spec.get("nodes") or {}).items()):
+        fn = node.get("function")
+        node["params"] = normalize_read_params(fn, node.get("params") or {})
+        spec["nodes"][nid] = node
+
+    return {"yaml": pyyaml.safe_dump(spec, sort_keys=False), "spec": spec, "mode": mode}
+
+
 
 # ======================== Main ========================
 

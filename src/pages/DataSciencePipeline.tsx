@@ -25,6 +25,24 @@ function canonicalizeFuncName(fn: string) {
   return fn.replace(/^pandas\./, "").replace(/^numpy\./, "");
 }
 
+function isReadFunction(fn: string) {
+  const base = (canonicalizeFuncName(fn) || "").split(".").pop() || "";
+  return (
+    base.startsWith("read_") ||
+    [
+      "read_csv",
+      "read_json",
+      "read_excel",
+      "read_parquet",
+      "read_feather",
+      "read_pickle",
+      "read_html",
+      "read_xml",
+      "read_table",
+    ].includes(base)
+  );
+}
+
 function safeParseYaml<T = any>(text: string): T {
   try {
     return (yaml.parse(text) as T) || ({} as T);
@@ -377,7 +395,7 @@ export default function DataSciencePipelinePage() {
             target: id,
             animated: true,
             style: { stroke: "hsl(var(--primary))", strokeWidth: 3 },
-            type: "smoothstep", // spline-like
+            type: "smoothstep",
           });
         });
       });
@@ -506,28 +524,53 @@ export default function DataSciencePipelinePage() {
     if (!nlPrompt.trim()) return;
     setGenBusy(true);
     try {
+      // find the "current" node to continue from
+      const cur = safeParseYaml<any>(yamlText);
+      const orderedIds = Object.keys(cur?.nodes || {});
+      const receiver = orderedIds.length ? orderedIds[orderedIds.length - 1] : "";
+  
       const fd = new FormData();
       fd.append("prompt", nlPrompt);
-      fd.append("yaml", yamlText);   // backend expects 'yaml'
+  
+      // send all three names for backward/forward compat with the backend
+      fd.append("yaml", yamlText);
+      fd.append("yaml_text", yamlText);
+      fd.append("current_yaml", yamlText);
+  
+      // NEW: tell backend which node to continue from
+      if (receiver) fd.append("receiver", receiver);
+  
       fd.append("mode", "append");
-
+  
       const res = await fetch(`${API_BASE}/nl2yaml`, { method: "POST", body: fd });
       if (!res.ok) {
         const txt = await res.text();
         throw new Error(`NL2YAML HTTP ${res.status}: ${txt.slice(0, 400)}`);
       }
+  
       const data = await res.json(); // { yaml, spec, mode }
       const addSpec = data?.spec || safeParseYaml<any>(data?.yaml || "");
-
-      const cur = safeParseYaml<any>(yamlText);
-      if (!cur.nodes) cur.nodes = {};
-      const taken = new Set(Object.keys(cur.nodes));
+  
+      const curSpec = safeParseYaml<any>(yamlText);
+      if (!curSpec.nodes) curSpec.nodes = {};
+      const taken = new Set(Object.keys(curSpec.nodes));
       const newNodes: Record<string, any> = (addSpec?.nodes || {}) as Record<string, any>;
-
-      // resolve id collisions
+  
+      // resolve id collisions but DO NOT create duplicates; we just keep unique ids
       const renameMap = new Map<string, string>();
       for (const id of Object.keys(newNodes)) {
         if (taken.has(id)) {
+          // if exact duplicate node already exists, just skip adding it
+          const existing = curSpec.nodes[id];
+          const incoming = newNodes[id];
+          if (
+            existing &&
+            existing.function === incoming.function &&
+            JSON.stringify(existing.params || {}) === JSON.stringify(incoming.params || {})
+          ) {
+            continue;
+          }
+          // otherwise, make a unique id
           const uid = makeUniqueId(id, taken);
           renameMap.set(id, uid);
           taken.add(uid);
@@ -535,32 +578,32 @@ export default function DataSciencePipelinePage() {
           taken.add(id);
         }
       }
-
+  
       const patched: Record<string, any> = {};
       for (const [id, node] of Object.entries(newNodes)) {
         const newId = renameMap.get(id) || id;
         const deps = Array.isArray((node as any).dependencies) ? (node as any).dependencies : [];
         const params = (node as any).params || {};
-
+  
         const deps2 = deps.map((d: string) => renameMap.get(d) || d);
-
+  
         let params2 = rewriteRefs(params, id, newId);
         for (const [oldId, newOne] of renameMap.entries()) {
           if (oldId !== id) params2 = rewriteRefs(params2, oldId, newOne);
         }
-
+  
         patched[newId] = {
           ...node,
           function: canonicalizeFuncName((node as any).function || ""),
           dependencies: deps2,
-          params: patched[newId]?.function === "read_csv" ? aliasReadCsvParams(params2) : params2,
+          params: (patched[newId]?.function === "read_csv") ? aliasReadCsvParams(params2) : params2,
         };
       }
-
+  
       // merge then normalize (auto-wire receivers if missing)
-      const mergedSpec = { nodes: { ...cur.nodes, ...patched } };
+      const mergedSpec = { nodes: { ...curSpec.nodes, ...patched } };
       normalizeSpec(mergedSpec);
-
+  
       const merged = stringifyYaml(mergedSpec);
       setYamlText(merged);
       setNlPrompt("");
@@ -571,6 +614,7 @@ export default function DataSciencePipelinePage() {
       setGenBusy(false);
     }
   }
+  
 
   return (
     <div className="pipeline-container">
