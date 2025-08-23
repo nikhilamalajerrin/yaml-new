@@ -1,15 +1,18 @@
+// src/pages/DataSciencePipeline.tsx
 import React, { useState, useEffect } from "react";
 import { useNodesState, useEdgesState, NodeChange } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import yaml from "yaml";
-import { Sparkles, Database, Settings, Wand2, Loader2 } from "lucide-react";
+import { Database, Settings, Wand2, Loader2 } from "lucide-react";
 
-import { FileUpload } from "@/components/FileUpload";
 import { TableModal } from "@/components/TableModal";
 import { PipelineFlow } from "@/components/PipelineFlow";
 import { YamlEditor } from "@/components/YamlEditor";
 import { FunctionSearch } from "@/components/FunctionSearch";
 import { ParameterSelector } from "@/components/ParameterSelector";
+
+// use the global file bus so the file chosen in "Data Sources" is available here
+import { getSelectedFile, onSelectedFile } from "@/lib/files";
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string) || "/api";
 
@@ -23,24 +26,6 @@ function shortName(full: string) {
 function canonicalizeFuncName(fn: string) {
   if (!fn) return fn;
   return fn.replace(/^pandas\./, "").replace(/^numpy\./, "");
-}
-
-function isReadFunction(fn: string) {
-  const base = (canonicalizeFuncName(fn) || "").split(".").pop() || "";
-  return (
-    base.startsWith("read_") ||
-    [
-      "read_csv",
-      "read_json",
-      "read_excel",
-      "read_parquet",
-      "read_feather",
-      "read_pickle",
-      "read_html",
-      "read_xml",
-      "read_table",
-    ].includes(base)
-  );
 }
 
 function safeParseYaml<T = any>(text: string): T {
@@ -149,7 +134,10 @@ export default function DataSciencePipelinePage() {
   const [nodes, setNodes, onNodesChangeBase] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [yamlText, setYamlText] = useState("nodes: {}");
-  const [file, setFile] = useState<File | null>(null);
+
+  // File is supplied by the Data Sources page via global bus
+  const [selectedFile, setSelectedFile] = useState<File | null>(getSelectedFile());
+
   const [preloaded, setPreloaded] = useState<any[]>([]);
   const [tableModal, setTableModal] = useState<{ open: boolean; table: any | null }>({
     open: false,
@@ -173,6 +161,13 @@ export default function DataSciencePipelinePage() {
   const [nlPrompt, setNlPrompt] = useState("");
   const [genBusy, setGenBusy] = useState(false);
 
+  // Subscribe to file bus
+  useEffect(() => {
+    setSelectedFile(getSelectedFile());
+    const off = onSelectedFile((f) => setSelectedFile(f));
+    return off;
+  }, []);
+
   // preload some pandas funcs (so we can auto-add read_csv)
   useEffect(() => {
     fetch(`${API_BASE}/pandas/search?query=read_`)
@@ -181,16 +176,16 @@ export default function DataSciencePipelinePage() {
       .catch(() => {});
   }, []);
 
-  // Auto-add read_csv when a file is uploaded and there are no nodes yet
+  // Auto-add read_csv when a file is chosen and there are no nodes yet
   useEffect(() => {
-    if (file && nodes.length === 0) {
+    if (selectedFile && nodes.length === 0) {
       const readCsv = preloaded.find((f: any) => shortName(f.name) === "read_csv");
       if (readCsv) {
-        createNodeWithParams(readCsv, { filepath_or_buffer: file.name });
+        createNodeWithParams(readCsv, { filepath_or_buffer: selectedFile.name });
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, preloaded]);
+  }, [selectedFile, preloaded]);
 
   function nodeStyle() {
     return {
@@ -260,12 +255,12 @@ export default function DataSciencePipelinePage() {
       }
     }
 
-    // auto-fill filename for read_* if available
-    if (file && fnCanon === "read_csv") {
+    // auto-fill filename for read_* if available (from global bus)
+    if (selectedFile && fnCanon === "read_csv") {
       selectedParams = aliasReadCsvParams(selectedParams);
       for (const k of ["filepath_or_buffer", "path_or_buf", "io", "file_path", "filepath"]) {
         if (!selectedParams[k]) {
-          selectedParams[k] = file.name;
+          selectedParams[k] = selectedFile.name;
           break;
         }
       }
@@ -439,7 +434,8 @@ export default function DataSciencePipelinePage() {
     const fd = new FormData();
     fd.append("yaml", yamlText);
     fd.append("preview_node", node.id);
-    if (file) fd.append("file", file, file.name);
+    // attach the globally-selected file if present
+    if (selectedFile) fd.append("file", selectedFile, selectedFile.name);
 
     try {
       const res = await fetch(`${API_BASE}/pipeline/run`, { method: "POST", body: fd });
@@ -528,34 +524,34 @@ export default function DataSciencePipelinePage() {
       const cur = safeParseYaml<any>(yamlText);
       const orderedIds = Object.keys(cur?.nodes || {});
       const receiver = orderedIds.length ? orderedIds[orderedIds.length - 1] : "";
-  
+
       const fd = new FormData();
       fd.append("prompt", nlPrompt);
-  
+
       // send all three names for backward/forward compat with the backend
       fd.append("yaml", yamlText);
       fd.append("yaml_text", yamlText);
       fd.append("current_yaml", yamlText);
-  
-      // NEW: tell backend which node to continue from
+
+      // tell backend which node to continue from
       if (receiver) fd.append("receiver", receiver);
-  
+
       fd.append("mode", "append");
-  
+
       const res = await fetch(`${API_BASE}/nl2yaml`, { method: "POST", body: fd });
       if (!res.ok) {
         const txt = await res.text();
         throw new Error(`NL2YAML HTTP ${res.status}: ${txt.slice(0, 400)}`);
       }
-  
+
       const data = await res.json(); // { yaml, spec, mode }
       const addSpec = data?.spec || safeParseYaml<any>(data?.yaml || "");
-  
+
       const curSpec = safeParseYaml<any>(yamlText);
       if (!curSpec.nodes) curSpec.nodes = {};
       const taken = new Set(Object.keys(curSpec.nodes));
       const newNodes: Record<string, any> = (addSpec?.nodes || {}) as Record<string, any>;
-  
+
       // resolve id collisions but DO NOT create duplicates; we just keep unique ids
       const renameMap = new Map<string, string>();
       for (const id of Object.keys(newNodes)) {
@@ -578,20 +574,20 @@ export default function DataSciencePipelinePage() {
           taken.add(id);
         }
       }
-  
+
       const patched: Record<string, any> = {};
       for (const [id, node] of Object.entries(newNodes)) {
         const newId = renameMap.get(id) || id;
         const deps = Array.isArray((node as any).dependencies) ? (node as any).dependencies : [];
         const params = (node as any).params || {};
-  
+
         const deps2 = deps.map((d: string) => renameMap.get(d) || d);
-  
+
         let params2 = rewriteRefs(params, id, newId);
         for (const [oldId, newOne] of renameMap.entries()) {
           if (oldId !== id) params2 = rewriteRefs(params2, oldId, newOne);
         }
-  
+
         patched[newId] = {
           ...node,
           function: canonicalizeFuncName((node as any).function || ""),
@@ -599,11 +595,11 @@ export default function DataSciencePipelinePage() {
           params: (patched[newId]?.function === "read_csv") ? aliasReadCsvParams(params2) : params2,
         };
       }
-  
+
       // merge then normalize (auto-wire receivers if missing)
       const mergedSpec = { nodes: { ...curSpec.nodes, ...patched } };
       normalizeSpec(mergedSpec);
-  
+
       const merged = stringifyYaml(mergedSpec);
       setYamlText(merged);
       setNlPrompt("");
@@ -614,31 +610,21 @@ export default function DataSciencePipelinePage() {
       setGenBusy(false);
     }
   }
-  
+
+  /* --------------------------- RENDER --------------------------- */
 
   return (
     <div className="pipeline-container">
+      {/* No hero/header; tighter top padding */}
       <div className="container mx-auto p-6">
-        <header className="mb-8 text-center">
-          <div className="flex items-center justify-center gap-3 mb-4">
-            <div className="p-3 rounded-xl bg-gradient-primary">
-              <Sparkles className="w-8 h-8 text-white" />
-            </div>
-            <h1 className="text-4xl font-bold glow-text">Tharavu Dappa</h1>
-          </div>
-          <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
-            Build data pipelines visually. Double-click any block to preview its real output.
-          </p>
-        </header>
-
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 h-[80vh]">
           <YamlEditor yamlText={yamlText} onYamlChange={setYamlText} onRunPipeline={runPipeline} />
 
           <div className="pipeline-panel flex flex-col">
             <div className="p-6 border-b border-border/50">
               <div className="flex flex-col gap-4">
+                {/* Upload block was moved to Data Sources page – keep only search */}
                 <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
-                  <FileUpload onFileSelected={setFile} selectedFile={file} />
                   <FunctionSearch onSelectFunction={addFunctionNode} />
                 </div>
 
