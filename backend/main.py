@@ -874,6 +874,100 @@ async def nl2yaml(
     return {"yaml": pyyaml.safe_dump(spec, sort_keys=False), "spec": spec, "mode": mode}
 
 
+# ======================== Auth & Ping (Append) ========================
+# This block adds /ping, /auth/login, /me using your DB functions in schema app.*
+# It does not modify any existing routes.
+
+import os
+from typing import Optional
+import psycopg
+from fastapi import HTTPException, Header
+from pydantic import BaseModel
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://dappa:password@localhost:5432/dappa"
+)
+
+def _db():
+    # One short-lived connection per request (simple & safe)
+    return psycopg.connect(DATABASE_URL)
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    role: str
+
+class LoginOut(BaseModel):
+    token: str
+    user: UserOut
+
+@app.get("/ping")
+def ping():
+    """Health check that also confirms DB connectivity."""
+    try:
+        with _db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            _ = cur.fetchone()
+        return {"ok": True, "db": "ok"}
+    except Exception as e:
+        # Keep 200 so the UI renders, but show the error string
+        return {"ok": True, "db": f"error: {e.__class__.__name__}: {e}"}
+
+def _parse_bearer(auth_header: Optional[str]) -> str:
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Use 'Authorization: Bearer <token>'")
+    return parts[1]
+
+def _user_from_token(token: str) -> UserOut:
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT app.get_user_id_by_token(%s)", (token,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        uid = row[0]
+        cur.execute("SELECT id::text, email::text, role FROM app.users WHERE id = %s", (uid,))
+        u = cur.fetchone()
+        if not u:
+            raise HTTPException(status_code=401, detail="User not found")
+        return UserOut(id=u[0], email=u[1], role=u[2])
+
+@app.post("/auth/login", response_model=LoginOut)
+def auth_login(payload: LoginIn):
+    """Verify credentials using app.verify_user, then issue a session via app.issue_session."""
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT app.verify_user(%s, %s)", (payload.email, payload.password))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        uid = row[0]
+
+        cur.execute("SELECT (app.issue_session(%s)).token", (uid,))
+        token = cur.fetchone()[0]
+
+        cur.execute("SELECT id::text, email::text, role FROM app.users WHERE id = %s", (uid,))
+        u = cur.fetchone()
+
+        return {"token": token, "user": {"id": u[0], "email": u[1], "role": u[2]}}
+
+@app.get("/me", response_model=UserOut)
+def me(Authorization: Optional[str] = Header(default=None)):
+    """Return current user using Bearer token."""
+    token = _parse_bearer(Authorization)
+    return _user_from_token(token)
+# ====================== End Auth & Ping (Append) ======================
+
+
+
+
+
 
 # ======================== Main ========================
 
