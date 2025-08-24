@@ -1,60 +1,18 @@
-// import React from "react";
-// import Editor from "@monaco-editor/react";
-// import { Play, Database } from "lucide-react";
-
-// interface YamlEditorProps {
-//   yamlText: string;
-//   onYamlChange: (value: string) => void;
-//   onRunPipeline: () => void;
-// }
-
-// export function YamlEditor({ yamlText, onYamlChange, onRunPipeline }: YamlEditorProps) {
-//   return (
-//     <div className="pipeline-panel flex flex-col">
-//       <div className="flex items-center justify-between p-6 border-b border-border/50">
-//         <div className="flex items-center gap-3">
-//           <div className="p-2 rounded-lg bg-primary/20">
-//             <Database className="w-5 h-5 text-primary" />
-//           </div>
-//           <h2 className="text-xl font-bold">YAML Configuration</h2>
-//         </div>
-//         <button
-//           className="pipeline-button flex items-center gap-2"
-//           onClick={onRunPipeline}
-//         >
-//           <Play className="w-4 h-4" />
-//           Run Pipeline
-//         </button>
-//       </div>
-//       <div className="flex-1 p-6">
-//         <Editor
-//           height="100%"
-//           defaultLanguage="yaml"
-//           value={yamlText}
-//           onChange={(val) => onYamlChange(val || "nodes: {}")}
-//           theme="vs-dark"
-//           options={{
-//             minimap: { enabled: false },
-//             fontSize: 14,
-//             lineHeight: 1.6,
-//             fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-//             scrollBeyondLastLine: false,
-//           }}
-//         />
-//       </div>
-//     </div>
-//   );
-// }
-
 // src/components/YamlEditor.tsx
 import React from "react";
 import Editor, { type BeforeMount } from "@monaco-editor/react";
-import { Play, Database } from "lucide-react";
+import { Play, Database, Save, Loader2 } from "lucide-react";
 
 interface YamlEditorProps {
   yamlText: string;
   onYamlChange: (value: string) => void;
   onRunPipeline: () => void;
+
+  // NEW: pipeline naming + save
+  name: string;
+  onNameChange: (value: string) => void;
+  onSave: () => void;
+  saving?: boolean;
 }
 
 const beforeMount: BeforeMount = (monaco) => {
@@ -63,7 +21,7 @@ const beforeMount: BeforeMount = (monaco) => {
     inherit: true,
     rules: [],
     colors: {
-      // keep the editor fully transparent so it blends with the panel
+      // make the editor background transparent to blend with the panel
       "editor.background": "#00000000",
       "editorGutter.background": "#00000000",
 
@@ -99,23 +57,65 @@ const beforeMount: BeforeMount = (monaco) => {
   });
 };
 
-export function YamlEditor({ yamlText, onYamlChange, onRunPipeline }: YamlEditorProps) {
+export function YamlEditor({
+  yamlText,
+  onYamlChange,
+  onRunPipeline,
+  name,
+  onNameChange,
+  onSave,
+  saving = false,
+}: YamlEditorProps) {
   return (
     <div className="pipeline-panel flex flex-col">
-      <div className="flex items-center justify-between p-6 border-b border-border/50">
-        <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-primary/20">
-            <Database className="w-5 h-5 text-primary" />
+      {/* Header */}
+      <div className="p-4 sm:p-6 border-b border-border/50">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          {/* Left: title (small, non-overlapping icon) */}
+          <div className="flex items-center gap-2">
+            <div className="p-1.5 rounded-md bg-primary/15">
+              <Database className="w-4 h-4 text-primary" />
+            </div>
+            <h2 className="text-lg sm:text-xl font-semibold">YAML Configuration</h2>
           </div>
-          <h2 className="text-xl font-bold">YAML Configuration</h2>
+
+          {/* Middle: pipeline name input (grows; wraps on small screens) */}
+          <div className="flex-1 md:max-w-[48%]">
+            <input
+              className="pipeline-input w-full"
+              placeholder="Untitled pipeline"
+              value={name}
+              onChange={(e) => onNameChange(e.target.value)}
+              title="Pipeline name"
+            />
+          </div>
+
+          {/* Right: actions */}
+          <div className="flex items-center gap-2">
+            <button
+              className="pipeline-button-secondary flex items-center gap-2 disabled:opacity-60"
+              onClick={onSave}
+              disabled={saving || !name.trim()}
+              title={name.trim() ? "Save pipeline" : "Enter a name to save"}
+            >
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              <span>Save</span>
+            </button>
+
+            <button
+              className="pipeline-button flex items-center gap-2"
+              onClick={onRunPipeline}
+              title="Run Pipeline"
+            >
+              <Play className="w-4 h-4" />
+              <span>Run</span>
+            </button>
+          </div>
         </div>
-        <button className="pipeline-button flex items-center gap-2" onClick={onRunPipeline}>
-          <Play className="w-4 h-4" />
-          Run Pipeline
-        </button>
       </div>
 
-      <div className="flex-1 p-6">
+      {/* Editor */}
+      <div className="flex-1 p-4 sm:p-6">
         <Editor
           height="100%"
           defaultLanguage="yaml"
@@ -141,4 +141,3 @@ export function YamlEditor({ yamlText, onYamlChange, onRunPipeline }: YamlEditor
     </div>
   );
 }
-

@@ -36,6 +36,36 @@ interface ParameterSelectorProps {
 /* ---------- helpers ---------- */
 const RECEIVER_KEYS = new Set(["self", "df", "left", "right"]);
 
+// For read_* we want canonical param first and aliases last
+const READ_ALIASES_BOTTOM = new Set(["path_or_buf", "filepath", "file_path", "io"]);
+
+// Curated list of commonly-used params per function (canonical names)
+const IMPORTANT_BY_FN: Record<string, string[]> = {
+  // pandas IO
+  read_csv: [
+    "filepath_or_buffer", "sep", "header", "names", "index_col", "usecols",
+    "dtype", "parse_dates", "skiprows", "nrows", "encoding", "na_values",
+    "thousands", "decimal"
+  ],
+  read_json: ["path_or_buf", "orient", "typ", "dtype", "lines"],
+  read_parquet: ["path", "columns"],
+  read_excel: ["io", "sheet_name", "header", "usecols", "dtype"],
+  // DataFrame methods
+  "DataFrame.rename": ["columns", "index", "inplace", "axis"],
+  "DataFrame.drop": ["columns", "labels", "axis", "inplace"],
+  "DataFrame.iloc": ["rows", "cols"],
+  "DataFrame.loc": ["rows", "cols"],
+  // merge variants
+  merge: ["right", "on", "left_on", "right_on", "how", "suffixes"],
+  "DataFrame.merge": ["right", "on", "left_on", "right_on", "how", "suffixes"],
+};
+
+function canonicalFn(name?: string) {
+  if (!name) return "";
+  let n = name.replace(/^pandas\./, "").replace(/^numpy\./, "");
+  return n;
+}
+
 function toDisplayString(v: any): string {
   if (v === undefined || v === null) return "";
   if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
@@ -101,21 +131,57 @@ export function ParameterSelector({
   // Build field list (params from def + any extra already in YAML)
   const fields = React.useMemo<Parameter[]>(() => {
     const fromDef = (funcDef?.params || []) as Parameter[];
+
+    // extras: present in YAML but not in signature
     const extras = Object.keys(initialParams || {})
       .filter((k) => !fromDef.find((p) => p.name === k))
       .map((k) => ({ name: k }));
+
+    // merge unique by name
     const merged: Parameter[] = [];
     [...fromDef, ...extras].forEach((p) => {
       if (!merged.find((x) => x.name === p.name)) merged.push(p);
     });
-    // keep receivers near the top for convenience
-    const order = (n: string) => (RECEIVER_KEYS.has(n) ? 0 : 1);
+
+    // sort with a priority function
+    const key = canonicalFn(funcDef?.name);
+    const important = IMPORTANT_BY_FN[key] || [];
+
+    const weight = (p: Parameter): number => {
+      const n = p.name;
+
+      // absolute top: receiver keys
+      if (RECEIVER_KEYS.has(n)) {
+        // further ensure "self" comes before other receivers
+        return n === "self" ? -1000 : -990;
+      }
+
+      // for read_*: show filepath_or_buffer right after receiver (if any)
+      const isRead = key === "read_csv" || key.startsWith("read_");
+      if (isRead && n === "filepath_or_buffer") return -980;
+
+      // required params next
+      if (p.required) return -900;
+
+      // common/important params next – order by position in list
+      const idx = important.indexOf(n);
+      if (idx >= 0) return -800 + idx; // preserve given ordering
+
+      // de-prioritize legacy alias keys for reads
+      if (isRead && READ_ALIASES_BOTTOM.has(n)) return 900;
+
+      // default bucket
+      return 0;
+    };
+
     merged.sort((a, b) => {
-      const oa = order(a.name);
-      const ob = order(b.name);
-      if (oa !== ob) return oa - ob;
+      const wa = weight(a);
+      const wb = weight(b);
+      if (wa !== wb) return wa - wb;
+      // within same bucket, alphabetical
       return a.name.localeCompare(b.name);
     });
+
     return merged;
   }, [funcDef, initialParams]);
 

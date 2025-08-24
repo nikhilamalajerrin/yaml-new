@@ -13,6 +13,7 @@ import { ParameterSelector } from "@/components/ParameterSelector";
 
 // use the global file bus so the file chosen in "Data Sources" is available here
 import { getSelectedFile, onSelectedFile } from "@/lib/files";
+import { authFetch, getToken } from "@/lib/auth";
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string) || "/api";
 
@@ -65,16 +66,51 @@ function rewriteRefs(obj: any, fromId: string, toId: string) {
   return obj;
 }
 
-function aliasReadCsvParams(params: Record<string, any> = {}) {
-  const p = { ...params };
-  if (p.filepath_or_buffer == null) {
-    for (const alt of ["filepath", "file_path", "path", "path_or_buf", "io"]) {
-      if (p[alt] != null) {
-        p.filepath_or_buffer = p[alt];
+/** read_* canonicalization:
+ *  - ensure ONLY `filepath_or_buffer` exists (remove aliases)
+ *  - fill from the first present alias if canonical missing
+ */
+const READ_FN_SET = new Set([
+  "read_csv",
+  "read_json",
+  "read_excel",
+  "read_parquet",
+  "read_feather",
+  "read_pickle",
+  "read_html",
+  "read_xml",
+  "read_table",
+]);
+const READ_ALIASES = ["filepath_or_buffer", "filepath", "file_path", "path", "path_or_buf", "io"];
+
+function isReadFn(fn: string) {
+  const base = canonicalizeFuncName(fn).split(".").pop() || "";
+  return base.startsWith("read_") || READ_FN_SET.has(base);
+}
+
+function canonicalizeReadParams(fn: string, params: Record<string, any> = {}) {
+  if (!isReadFn(fn)) return params;
+  const p: Record<string, any> = { ...params };
+
+  // Resolve value
+  let val = p.filepath_or_buffer;
+  if (val == null) {
+    for (const k of READ_ALIASES) {
+      if (k !== "filepath_or_buffer" && p[k] != null) {
+        val = p[k];
         break;
       }
     }
   }
+
+  // Remove all aliases
+  for (const k of READ_ALIASES) {
+    if (k !== "filepath_or_buffer" && k in p) delete p[k];
+  }
+
+  // Set canonical if present
+  if (val != null) p.filepath_or_buffer = val;
+
   return p;
 }
 
@@ -97,14 +133,21 @@ function autoWireReceiverForNode(
   const fn = canonicalizeFuncName(node.function || "");
   node.function = fn;
 
-  if (fn === "read_csv") {
-    node.params = aliasReadCsvParams(node.params || {});
+  // canonicalize all read_* params (only keep filepath_or_buffer)
+  if (isReadFn(fn)) {
+    node.params = canonicalizeReadParams(fn, node.params || {});
   }
 
-  if (!needsReceiver(fn)) return;
+  if (!needsReceiver(fn)) {
+    spec.nodes[id] = node;
+    return;
+  }
 
   const params = node.params || {};
-  if (params.self) return; // already wired
+  if (params.self) {
+    spec.nodes[id] = node;
+    return; // already wired
+  }
 
   const deps: string[] = Array.isArray(node.dependencies) ? node.dependencies : [];
   const candidate = deps[deps.length - 1] || orderedIds[idxInOrder - 1];
@@ -134,6 +177,10 @@ export default function DataSciencePipelinePage() {
   const [nodes, setNodes, onNodesChangeBase] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [yamlText, setYamlText] = useState("nodes: {}");
+
+  // NEW: Pipeline name + save state
+  const [pipelineName, setPipelineName] = useState("");
+  const [saving, setSaving] = useState(false);
 
   // File is supplied by the Data Sources page via global bus
   const [selectedFile, setSelectedFile] = useState<File | null>(getSelectedFile());
@@ -167,6 +214,19 @@ export default function DataSciencePipelinePage() {
     const off = onSelectedFile((f) => setSelectedFile(f));
     return off;
   }, []);
+  
+  useEffect(() => { //from gpt
+    try {
+      const raw = localStorage.getItem("td_open_pipeline");
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (data?.yaml) setYamlText(data.yaml);
+    } finally {
+      localStorage.removeItem("td_open_pipeline");
+    }
+  }, []);
+  
+
 
   // preload some pandas funcs (so we can auto-add read_csv)
   useEffect(() => {
@@ -219,9 +279,10 @@ export default function DataSciencePipelinePage() {
     fetch(`${API_BASE}/pandas/function/${encodeURIComponent(canon)}`)
       .then((r) => r.json())
       .then((funcDef) => {
-        // alias read_csv params so the modal shows values
-        const initial =
-          canon === "read_csv" ? aliasReadCsvParams(entry.params || {}) : (entry.params || {});
+        // canonicalize read_* params so the modal shows ONLY filepath_or_buffer
+        const initial = isReadFn(canon)
+          ? canonicalizeReadParams(canon, entry.params || {})
+          : (entry.params || {});
         setParamModal({
           open: true,
           nodeId,
@@ -235,7 +296,7 @@ export default function DataSciencePipelinePage() {
           open: true,
           nodeId,
           funcDef: { name: canon, params: [] },
-          params: entry.params || {},
+          params: isReadFn(canon) ? canonicalizeReadParams(canon, entry.params || {}) : (entry.params || {}),
           dependencies: entry.dependencies || [],
         });
       });
@@ -256,14 +317,14 @@ export default function DataSciencePipelinePage() {
     }
 
     // auto-fill filename for read_* if available (from global bus)
-    if (selectedFile && fnCanon === "read_csv") {
-      selectedParams = aliasReadCsvParams(selectedParams);
-      for (const k of ["filepath_or_buffer", "path_or_buf", "io", "file_path", "filepath"]) {
-        if (!selectedParams[k]) {
-          selectedParams[k] = selectedFile.name;
-          break;
-        }
+    if (selectedFile && isReadFn(fnCanon)) {
+      selectedParams = canonicalizeReadParams(fnCanon, selectedParams);
+      if (selectedParams.filepath_or_buffer == null) {
+        selectedParams.filepath_or_buffer = selectedFile.name;
       }
+    } else if (isReadFn(fnCanon)) {
+      // still canonicalize even without selected file
+      selectedParams = canonicalizeReadParams(fnCanon, selectedParams);
     }
 
     // visual node
@@ -494,9 +555,13 @@ export default function DataSciencePipelinePage() {
 
       // write normalized function name
       const fnCanon = canonicalizeFuncName(funcDef.name);
+      const cleanParams = isReadFn(fnCanon)
+        ? canonicalizeReadParams(fnCanon, newParams)
+        : newParams;
+
       parsed.nodes[nodeId] = {
         function: fnCanon,
-        params: fnCanon === "read_csv" ? aliasReadCsvParams(newParams) : newParams,
+        params: cleanParams,
         dependencies: dependencies || [],
       };
 
@@ -588,11 +653,16 @@ export default function DataSciencePipelinePage() {
           if (oldId !== id) params2 = rewriteRefs(params2, oldId, newOne);
         }
 
+        const fnCanon = canonicalizeFuncName((node as any).function || "");
+        const finalParams = isReadFn(fnCanon)
+          ? canonicalizeReadParams(fnCanon, params2)
+          : params2;
+
         patched[newId] = {
           ...node,
-          function: canonicalizeFuncName((node as any).function || ""),
+          function: fnCanon,
           dependencies: deps2,
-          params: (patched[newId]?.function === "read_csv") ? aliasReadCsvParams(params2) : params2,
+          params: finalParams,
         };
       }
 
@@ -611,6 +681,38 @@ export default function DataSciencePipelinePage() {
     }
   }
 
+  /* -------- SAVE PIPELINE (DB) -------- */
+  async function savePipeline() {
+    if (!pipelineName.trim()) {
+      alert("Please enter a pipeline name before saving.");
+      return;
+    }
+    if (!getToken()) {
+      alert("Please log in to save pipelines.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const body = { name: pipelineName.trim(), yaml: yamlText };
+      // expects backend route: POST /pipelines { name, yaml } → { id, name, yaml }
+      const res = await authFetch<{ id: string; name: string; yaml: string }>("/pipelines", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      // simple confirmation
+      alert(`Saved pipeline: ${res.name}`);
+    } catch (e: any) {
+      console.error(e);
+      alert(String(e?.message || e));
+    } finally {
+      setSaving(false);
+    }
+  }
+   
+
+  // Auto-import a pipeline chosen from the dashboard/sidebar
+
   /* --------------------------- RENDER --------------------------- */
 
   return (
@@ -618,7 +720,16 @@ export default function DataSciencePipelinePage() {
       {/* No hero/header; tighter top padding */}
       <div className="container mx-auto p-6">
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 h-[80vh]">
-          <YamlEditor yamlText={yamlText} onYamlChange={setYamlText} onRunPipeline={runPipeline} />
+          <YamlEditor
+            yamlText={yamlText}
+            onYamlChange={setYamlText}
+            onRunPipeline={runPipeline}
+            // NEW
+            name={pipelineName}
+            onNameChange={setPipelineName}
+            onSave={savePipeline}
+            saving={saving}
+          />
 
           <div className="pipeline-panel flex flex-col">
             <div className="p-6 border-b border-border/50">

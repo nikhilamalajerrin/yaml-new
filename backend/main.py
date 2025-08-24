@@ -4,6 +4,7 @@ Tharavu Dappa Backend — Light index + Robust pipeline executor + NL→YAML
 - /pipeline/run executes pipelines with param coercion & reference resolution
 - Special handling for .iloc / .loc accepts Python-like slice text (1:10, :, 0:2, lists…)
 - /nl2yaml converts natural language to YAML (OpenRouter DeepSeek or heuristic fallback)
+- /pipelines/save, /pipelines (per-user), /stats (per-user), /pipelines/{id}
 """
 
 import os
@@ -17,13 +18,13 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 import requests
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, Form
+from fastapi import FastAPI, HTTPException, UploadFile, Form, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import yaml as pyyaml
 from io import BytesIO
 
-app = FastAPI(title="Tharavu Dappa Backend", version="3.5.0")
+app = FastAPI(title="Tharavu Dappa Backend", version="3.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -874,14 +875,10 @@ async def nl2yaml(
     return {"yaml": pyyaml.safe_dump(spec, sort_keys=False), "spec": spec, "mode": mode}
 
 
-# ======================== Auth & Ping (Append) ========================
-# This block adds /ping, /auth/login, /me using your DB functions in schema app.*
-# It does not modify any existing routes.
+# ======================== Auth & Ping ========================
 
-import os
-from typing import Optional
+from typing import Optional as _Optional
 import psycopg
-from fastapi import HTTPException, Header
 from pydantic import BaseModel
 
 DATABASE_URL = os.getenv(
@@ -918,7 +915,7 @@ def ping():
         # Keep 200 so the UI renders, but show the error string
         return {"ok": True, "db": f"error: {e.__class__.__name__}: {e}"}
 
-def _parse_bearer(auth_header: Optional[str]) -> str:
+def _parse_bearer(auth_header: _Optional[str]) -> str:
     if not auth_header:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     parts = auth_header.split()
@@ -958,16 +955,203 @@ def auth_login(payload: LoginIn):
         return {"token": token, "user": {"id": u[0], "email": u[1], "role": u[2]}}
 
 @app.get("/me", response_model=UserOut)
-def me(Authorization: Optional[str] = Header(default=None)):
+def me(Authorization: _Optional[str] = Header(default=None)):
     """Return current user using Bearer token."""
     token = _parse_bearer(Authorization)
     return _user_from_token(token)
-# ====================== End Auth & Ping (Append) ======================
 
+# ======================== Stats & Pipelines (per-user only) ========================
 
+from pydantic import BaseModel as _BaseModel
 
+class PipelineOut(_BaseModel):
+    id: str
+    owner_id: str
+    name: str
+    yaml: str
+    created_at: str
+    updated_at: str
 
+def _require_user_id(Authorization: _Optional[str]) -> str:
+    """Require a valid Bearer token and return the user id."""
+    token = _parse_bearer(Authorization)
+    u = _user_from_token(token)
+    return u.id
 
+@app.get("/stats")
+def stats(Authorization: _Optional[str] = Header(default=None)):
+    """
+    Per-user stats:
+      - pipelines / functions / data_sources owned by the user
+      - running = runs for the user's pipelines
+    """
+    uid = _require_user_id(Authorization)
+
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM app.pipelines    WHERE owner_id = %s) AS pipelines,
+              (SELECT COUNT(*) FROM app.functions    WHERE owner_id = %s) AS functions,
+              (SELECT COUNT(*) FROM app.data_sources WHERE owner_id = %s) AS sources,
+              (SELECT COUNT(*) FROM app.runs r
+                   JOIN app.pipelines p ON p.id = r.pipeline_id
+               WHERE r.status = 'running' AND p.owner_id = %s)         AS running
+            """,
+            (uid, uid, uid, uid),
+        )
+        r = cur.fetchone()
+
+    return {
+        "pipelines": r[0],
+        "functions": r[1],
+        "sources":   r[2],
+        "users":     1,     # single logged-in user context
+        "running":   r[3],
+    }
+
+@app.get("/pipelines")
+def list_pipelines(Authorization: _Optional[str] = Header(default=None)):
+    """
+    List pipelines owned by the current user.
+    """
+    uid = _require_user_id(Authorization)
+
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, owner_id::text, name, yaml, created_at, updated_at
+            FROM app.pipelines
+            WHERE owner_id = %s
+            ORDER BY updated_at DESC
+            LIMIT 500
+            """,
+            (uid,),
+        )
+        rows = cur.fetchall()
+
+    return {
+        "pipelines": [
+            {
+                "id": r[0],
+                "owner_id": r[1],
+                "name": r[2],
+                "yaml": r[3],
+                "created_at": r[4].isoformat(),
+                "updated_at": r[5].isoformat(),
+            }
+            for r in rows
+        ]
+    }
+
+@app.get("/pipelines/{pipeline_id}")
+def get_pipeline(pipeline_id: str, Authorization: _Optional[str] = Header(default=None)):
+    """
+    Get a single pipeline by id if owned by the current user.
+    """
+    uid = _require_user_id(Authorization)
+
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id::text, owner_id::text, name, yaml, created_at, updated_at
+            FROM app.pipelines
+            WHERE id = %s AND owner_id = %s
+            """,
+            (pipeline_id, uid),
+        )
+        r = cur.fetchone()
+
+    if not r:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    return {
+        "id": r[0],
+        "owner_id": r[1],
+        "name": r[2],
+        "yaml": r[3],
+        "created_at": r[4].isoformat(),
+        "updated_at": r[5].isoformat(),
+    }
+
+@app.post("/pipelines/save")
+async def save_pipeline(
+    request: Request,
+    Authorization: _Optional[str] = Header(default=None),
+    # Form fallbacks (the editor might send multipart/form-data)
+    pipeline_id: _Optional[str] = Form(default=None),
+    name: _Optional[str] = Form(default=None),
+    yaml_text: _Optional[str] = Form(default=None),
+    yaml: _Optional[str] = Form(default=None),
+):
+    """
+    Upsert a pipeline *owned by the current user*.
+    Accepts JSON: { id?, name, yaml } or form fields (pipeline_id?, name, yaml|yaml_text).
+    Enforces (owner_id, name) uniqueness.
+    """
+    uid = _require_user_id(Authorization)
+
+    body = {}
+    # If JSON payload, prefer it
+    try:
+        if "application/json" in (request.headers.get("content-type") or ""):
+            body = await request.json()
+    except Exception:
+        body = {}
+
+    # Merge JSON first, then form fields as fallback
+    pid = (body.get("id") if isinstance(body, dict) else None) or pipeline_id
+    nm  = (body.get("name") if isinstance(body, dict) else None) or name
+    ym  = (body.get("yaml") if isinstance(body, dict) else None) or yaml_text or yaml
+
+    if not nm or not ym:
+        raise HTTPException(status_code=400, detail="Missing 'name' or 'yaml'")
+
+    # Validate YAML minimally
+    try:
+        spec = pyyaml.safe_load(ym) or {}
+        if not isinstance(spec, dict) or "nodes" not in spec:
+            raise ValueError("YAML must contain top-level 'nodes'")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+
+    with _db() as conn, conn.cursor() as cur:
+        if pid:
+            # Update by id but ensure ownership
+            cur.execute(
+                """
+                UPDATE app.pipelines
+                   SET name = %s, yaml = %s, updated_at = now()
+                 WHERE id = %s AND owner_id = %s
+             RETURNING id::text, owner_id::text, name, yaml, created_at, updated_at
+                """,
+                (nm, ym, pid, uid),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Pipeline not found or not owned by user")
+        else:
+            # Upsert on (owner_id, name)
+            cur.execute(
+                """
+                INSERT INTO app.pipelines (owner_id, name, yaml)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (owner_id, name)
+                DO UPDATE SET yaml = EXCLUDED.yaml, updated_at = now()
+                RETURNING id::text, owner_id::text, name, yaml, created_at, updated_at
+                """,
+                (uid, nm, ym),
+            )
+            row = cur.fetchone()
+
+    return {
+        "id": row[0],
+        "owner_id": row[1],
+        "name": row[2],
+        "yaml": row[3],
+        "created_at": row[4].isoformat(),
+        "updated_at": row[5].isoformat(),
+        "status": "saved",
+    }
 
 # ======================== Main ========================
 
