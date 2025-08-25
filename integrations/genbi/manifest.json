@@ -1,0 +1,36 @@
+{
+    "project_id": "test11",
+    "manifest": {
+      "catalog": "test_catalog",
+      "schema": "test_schema",
+      "models": [
+        {
+          "name": "test_model",
+          "tableReference": {
+            "catalog": "test_catalog",
+            "schema": "test_schema",
+            "table": "test_table"
+          },
+          "columns": [
+            {
+              "name": "id",
+              "type": "INTEGER",
+              "notNull": true
+            },
+            {
+              "name": "name",
+              "type": "VARCHAR"
+            }
+          ],
+          "primaryKey": "id"
+        }
+      ],
+      "relationships": [],
+      "metrics": [],
+      "views": [],
+      "enumDefinitions": [],
+      "macros": [],
+      "cumulativeMetrics": [],
+      "dateSpine": {}
+    }
+  }
