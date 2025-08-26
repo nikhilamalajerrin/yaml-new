@@ -1,4 +1,3 @@
-// src/components/layout/sidebar.tsx
 import React from "react";
 import {
   Home,
@@ -7,10 +6,18 @@ import {
   Database,
   Settings as Gear,
   ChevronRight,
+  Sparkles,
 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { authFetch, getMe, getToken, type User } from "@/lib/auth";
 
-export type MenuKey = "dashboard" | "editor" | "functions" | "sources" | "settings";
+export type MenuKey =
+  | "dashboard"
+  | "editor"
+  | "functions"
+  | "sources"
+  | "genbi"        // 👈 NEW
+  | "settings";
 
 type SidebarProps = {
   active: MenuKey;
@@ -27,18 +34,18 @@ type Pipeline = {
 
 function initialsFromEmail(email?: string | null) {
   if (!email) return "TD";
-  const [left] = email.split("@");
+  const [left] = (email || "").split("@");
   const parts = left.replace(/[._-]+/g, " ").split(" ").filter(Boolean);
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
 export default function Sidebar({ active, onNavigate }: SidebarProps) {
+  const navigate = useNavigate();
   const [user, setUser] = React.useState<User | null>(null);
   const [pipelines, setPipelines] = React.useState<Pipeline[]>([]);
   const [openRecent, setOpenRecent] = React.useState(true);
 
-  // fetch user + pipelines (if logged in)
   React.useEffect(() => {
     (async () => {
       if (!getToken()) return;
@@ -48,9 +55,10 @@ export default function Sidebar({ active, onNavigate }: SidebarProps) {
       try {
         const data = await authFetch<{ pipelines: Pipeline[] }>("/pipelines");
         const list = (data?.pipelines || []).sort(
-          (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+          (a, b) =>
+            new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
         );
-        setPipelines(list.slice(0, 6)); // show last 6
+        setPipelines(list.slice(0, 6));
       } catch {
         setPipelines([]);
       }
@@ -59,33 +67,57 @@ export default function Sidebar({ active, onNavigate }: SidebarProps) {
 
   function importPipeline(p: Pipeline) {
     try {
-      localStorage.setItem("td_open_pipeline", JSON.stringify({ id: p.id, name: p.name, yaml: p.yaml }));
+      localStorage.setItem(
+        "td_open_pipeline",
+        JSON.stringify({ id: p.id, name: p.name, yaml: p.yaml })
+      );
     } catch {}
     onNavigate("editor");
   }
 
-  const navItem =
-    (key: MenuKey, label: string, Icon: any) =>
-      (
-        <button
-          key={key}
-          onClick={() => onNavigate(key)}
-          className={`w-full flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors
-            ${active === key
-              ? "bg-primary/15 text-primary border border-primary/30"
-              : "hover:bg-muted/40 text-foreground/90 border border-transparent"}`}
-        >
-          <Icon className={`h-4 w-4 ${active === key ? "text-primary" : "text-muted-foreground"}`} />
-          <span className="truncate">{label}</span>
-        </button>
-      );
+  const handleClick = (key: MenuKey) => {
+    // keep your existing parent-controlled navigation
+    onNavigate(key);
+
+    // additionally push a route where it exists
+    if (key === "genbi") navigate("/genbi-lab");
+    if (key === "dashboard") navigate("/");
+    if (key === "editor") navigate("/");        // keep your editor under "/"
+    if (key === "functions") navigate("/");     // adjust if you have routes
+    if (key === "sources") navigate("/");       // adjust if you have routes
+    if (key === "settings") navigate("/");      // adjust if you have routes
+  };
+
+  const navItem = (key: MenuKey, label: string, Icon: any) => (
+    <button
+      key={key}
+      onClick={() => handleClick(key)}
+      className={`w-full flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors
+        ${
+          active === key
+            ? "bg-primary/15 text-primary border border-primary/30"
+            : "hover:bg-muted/40 text-foreground/90 border border-transparent"
+        }`}
+    >
+      <Icon
+        className={`h-4 w-4 ${
+          active === key ? "text-primary" : "text-muted-foreground"
+        }`}
+      />
+      <span className="truncate">{label}</span>
+    </button>
+  );
 
   return (
     <aside className="w-[240px] shrink-0 border-r border-border/60 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/70 p-3 flex flex-col">
-      {/* Top: Brand */}
+      {/* Brand */}
       <div className="mb-3 px-1">
-        <div className="text-sm font-semibold tracking-wide text-muted-foreground">Tharavu Dappa</div>
-        <div className="text-[10px] text-muted-foreground/80">Pipeline Builder</div>
+        <div className="text-sm font-semibold tracking-wide text-muted-foreground">
+          Tharavu Dappa
+        </div>
+        <div className="text-[10px] text-muted-foreground/80">
+          Pipeline Builder
+        </div>
       </div>
 
       {/* Nav */}
@@ -94,10 +126,11 @@ export default function Sidebar({ active, onNavigate }: SidebarProps) {
         {navItem("editor", "Pipeline Editor", Workflow)}
         {navItem("functions", "Functions", Code2)}
         {navItem("sources", "Data Sources", Database)}
+        {navItem("genbi", "GenBI Lab", Sparkles)} {/* 👈 NEW */}
         {navItem("settings", "Settings", Gear)}
       </nav>
 
-      {/* Recent Pipelines (collapsible) */}
+      {/* Recent Pipelines */}
       {user && pipelines.length > 0 && (
         <div className="mt-4">
           <button
@@ -106,7 +139,9 @@ export default function Sidebar({ active, onNavigate }: SidebarProps) {
           >
             <span>Recent Pipelines</span>
             <ChevronRight
-              className={`h-3.5 w-3.5 transition-transform ${openRecent ? "rotate-90" : ""}`}
+              className={`h-3.5 w-3.5 transition-transform ${
+                openRecent ? "rotate-90" : ""
+              }`}
             />
           </button>
 
@@ -128,10 +163,9 @@ export default function Sidebar({ active, onNavigate }: SidebarProps) {
         </div>
       )}
 
-      {/* Spacer */}
       <div className="flex-1" />
 
-      {/* Bottom: Workspace card with avatar + email */}
+      {/* Workspace */}
       <div className="rounded-2xl border border-border/60 bg-muted/20 p-3">
         <div className="flex items-center gap-3">
           <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-primary/25 to-primary/10 grid place-items-center text-sm font-bold text-primary">

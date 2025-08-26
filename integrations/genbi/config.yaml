@@ -2,7 +2,7 @@ type: llm
 provider: litellm_llm
 models:
   - api_base: http://ollama:11434
-    model: ollama_chat/phi4:14b
+    model: ollama_chat/llama3.2:1b      # <- you pulled this one
     alias: default
     timeout: 600
     kwargs:
@@ -13,9 +13,11 @@ models:
 type: embedder
 provider: litellm_embedder
 models:
-  - model: openai/nomic-embed-text
-    alias: default
+  - alias: default
+    # use the OpenAI-compatible route
     api_base: http://ollama:11434/v1
+    model: openai/nomic-embed-text   # NOT ollama/nomic-embed-text
+    #api_key: "ollama"                # any non-empty string works
     timeout: 600
 
 ---
