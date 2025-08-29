@@ -1,8 +1,7 @@
-// src/pages/VannamBITraining.tsx
 import * as React from "react";
-import { vanna } from "@/lib/vanna";
 
 type Row = Record<string, any>;
+const API_BASE = "/api";
 
 export default function VannamBITraining() {
   const [rows, setRows] = React.useState<Row[]>([]);
@@ -14,12 +13,22 @@ export default function VannamBITraining() {
   const [sql, setSql] = React.useState("");
   const [question, setQuestion] = React.useState("");
 
+  async function jsonOrThrow(r: Response) {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || (j && j.type === "error")) {
+      const msg = j?.error || `${r.status} ${r.statusText}`;
+      throw new Error(msg);
+    }
+    return j;
+  }
+
   async function refresh() {
     setLoading(true);
     setErr("");
     try {
-      const resp = await vanna.getTrainingData();
-      const data = JSON.parse(resp.df || "[]");
+      const r = await fetch(`${API_BASE}/vanna/v0/get_training_data`);
+      const j = await jsonOrThrow(r);
+      const data = Array.isArray(j.records) ? j.records : JSON.parse(j.df || "[]");
       setRows(Array.isArray(data) ? data : []);
     } catch (e: any) {
       setErr(e?.message || "Failed to load training data");
@@ -33,25 +42,24 @@ export default function VannamBITraining() {
   }, []);
 
   async function add(kind: "ddl" | "documentation" | "sql" | "question") {
-    const body: any = {};
-    if (kind === "ddl" && ddl.trim()) body.ddl = ddl.trim();
-    if (kind === "documentation" && documentation.trim()) body.documentation = documentation.trim();
-    if (kind === "sql" && sql.trim()) body.sql = sql.trim();
-    if (kind === "question" && question.trim()) body.question = question.trim();
-    if (!Object.keys(body).length) return;
+    const payload: any = {};
+    if (kind === "ddl" && ddl.trim()) payload.ddl = ddl.trim();
+    if (kind === "documentation" && documentation.trim()) payload.documentation = documentation.trim();
+    if (kind === "sql" && sql.trim()) payload.sql = sql.trim();
+    if (kind === "question" && question.trim()) payload.question = question.trim();
+    if (!Object.keys(payload).length) return;
 
     try {
-      const resp = await vanna.train(body);
-      if ("id" in resp) {
-        // clear only the field we just sent
-        if (kind === "ddl") setDdl("");
-        if (kind === "documentation") setDocumentation("");
-        if (kind === "sql") setSql("");
-        if (kind === "question") setQuestion("");
-        await refresh();
-      } else {
-        alert((resp as any).error || "Training failed");
-      }
+      await fetch(`${API_BASE}/vanna/v0/train`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(jsonOrThrow);
+      if (kind === "ddl") setDdl("");
+      if (kind === "documentation") setDocumentation("");
+      if (kind === "sql") setSql("");
+      if (kind === "question") setQuestion("");
+      await refresh();
     } catch (e: any) {
       alert(e?.message || "Training failed");
     }
@@ -60,11 +68,15 @@ export default function VannamBITraining() {
   async function remove(id: string) {
     if (!confirm(`Remove training id ${id}?`)) return;
     try {
-      const resp = await vanna.removeTrainingData(id);
-      if ("success" in resp && resp.success) {
+      const u = new URL(`${API_BASE}/vanna/v0/remove_training_data`, location.origin);
+      u.searchParams.set("id", id);
+      const r = await fetch(u.toString(), { method: "DELETE" });
+      const j = await r.json().catch(() => ({}));
+      // Backend returns { ok: true } (not { success: true })
+      if (j?.ok || j?.success) {
         await refresh();
       } else {
-        alert((resp as any).error || "Remove failed");
+        throw new Error(j?.error || "Remove failed");
       }
     } catch (e: any) {
       alert(e?.message || "Remove failed");
@@ -87,34 +99,54 @@ export default function VannamBITraining() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="rounded-xl border p-4 bg-background/60 space-y-3">
           <h2 className="text-sm font-semibold">Add DDL</h2>
-          <textarea className="w-full min-h-[140px] border rounded p-2 font-mono text-xs"
+          <textarea
+            className="w-full min-h-[140px] border rounded p-2 font-mono text-xs"
             placeholder={`CREATE TABLE IF NOT EXISTS my_table (...);`}
-            value={ddl} onChange={(e) => setDdl(e.target.value)} />
-          <button onClick={() => add("ddl")} className="px-3 py-1.5 rounded border hover:bg-muted">Train DDL</button>
+            value={ddl}
+            onChange={(e) => setDdl(e.target.value)}
+          />
+          <button onClick={() => add("ddl")} className="px-3 py-1.5 rounded border hover:bg-muted">
+            Train DDL
+          </button>
         </div>
 
         <div className="rounded-xl border p-4 bg-background/60 space-y-3">
           <h2 className="text-sm font-semibold">Add Documentation</h2>
-          <textarea className="w-full min-h-[140px] border rounded p-2 text-sm"
+          <textarea
+            className="w-full min-h-[140px] border rounded p-2 text-sm"
             placeholder={`Explain business terms, KPIs, definitions...`}
-            value={documentation} onChange={(e) => setDocumentation(e.target.value)} />
-          <button onClick={() => add("documentation")} className="px-3 py-1.5 rounded border hover:bg-muted">Train Documentation</button>
+            value={documentation}
+            onChange={(e) => setDocumentation(e.target.value)}
+          />
+          <button onClick={() => add("documentation")} className="px-3 py-1.5 rounded border hover:bg-muted">
+            Train Documentation
+          </button>
         </div>
 
         <div className="rounded-xl border p-4 bg-background/60 space-y-3">
           <h2 className="text-sm font-semibold">Add SQL Examples</h2>
-          <textarea className="w-full min-h-[140px] border rounded p-2 font-mono text-xs"
+          <textarea
+            className="w-full min-h-[140px] border rounded p-2 font-mono text-xs"
             placeholder={`SELECT * FROM my_table WHERE ...;`}
-            value={sql} onChange={(e) => setSql(e.target.value)} />
-          <button onClick={() => add("sql")} className="px-3 py-1.5 rounded border hover:bg-muted">Train SQL</button>
+            value={sql}
+            onChange={(e) => setSql(e.target.value)}
+          />
+          <button onClick={() => add("sql")} className="px-3 py-1.5 rounded border hover:bg-muted">
+            Train SQL
+          </button>
         </div>
 
         <div className="rounded-xl border p-4 bg-background/60 space-y-3">
           <h2 className="text-sm font-semibold">Add Seed Questions</h2>
-          <textarea className="w-full min-h-[140px] border rounded p-2 text-sm"
+          <textarea
+            className="w-full min-h-[140px] border rounded p-2 text-sm"
             placeholder={`"What are daily orders?" (optional, Vanna can auto-generate too)`}
-            value={question} onChange={(e) => setQuestion(e.target.value)} />
-          <button onClick={() => add("question")} className="px-3 py-1.5 rounded border hover:bg-muted">Train Question</button>
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+          />
+          <button onClick={() => add("question")} className="px-3 py-1.5 rounded border hover:bg-muted">
+            Train Question
+          </button>
         </div>
       </section>
 
@@ -136,20 +168,28 @@ export default function VannamBITraining() {
               <thead className="bg-muted/50">
                 <tr>
                   <th className="px-3 py-2 text-left border-b">id</th>
-                  <th className="px-3 py-2 text-left border-b">preview</th>
+                  <th className="px-3 py-2 text-left border-b">type</th>
+                  <th className="px-3 py-2 text-left border-b">content</th>
                   <th className="px-3 py-2 text-left border-b">actions</th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r, i) => {
+                {rows.map((r: any, i: number) => {
                   const id = String(r.id ?? r.ID ?? r.key ?? i);
-                  const preview = JSON.stringify(r).slice(0, 140);
+                  const type = r.type ?? r.Type ?? r.kind ?? "";
+                  const content = (r.text || r.ddl || r.documentation || r.sql || r.plan || "").toString();
                   return (
-                    <tr key={id} className="odd:bg-muted/20">
-                      <td className="px-3 py-2 border-b font-mono text-xs">{id}</td>
-                      <td className="px-3 py-2 border-b text-xs">{preview}…</td>
-                      <td className="px-3 py-2 border-b">
-                        <button onClick={() => remove(id)} className="px-2 py-1 text-xs rounded border hover:bg-muted">
+                    <tr key={id} className="odd:bg-muted/20 align-top">
+                      <td className="px-3 py-2 border-b font-mono text-xs whitespace-nowrap">{id}</td>
+                      <td className="px-3 py-2 border-b text-xs whitespace-nowrap">{type}</td>
+                      <td className="px-3 py-2 border-b text-xs">
+                        <pre className="max-w-[600px] overflow-auto">{content}</pre>
+                      </td>
+                      <td className="px-3 py-2 border-b whitespace-nowrap">
+                        <button
+                          onClick={() => remove(id)}
+                          className="px-2 py-1 text-xs rounded border hover:bg-muted"
+                        >
                           Remove
                         </button>
                       </td>
