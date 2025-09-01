@@ -10,13 +10,13 @@ export default function VannamBITraining() {
 
   const [ddl, setDdl] = React.useState("");
   const [documentation, setDocumentation] = React.useState("");
-  const [sql, setSql] = React.useState("");
-  const [question, setQuestion] = React.useState("");
+  const [qSqlQuestion, setQSqlQuestion] = React.useState("");
+  const [qSqlSql, setQSqlSql] = React.useState("");
 
   async function jsonOrThrow(r: Response) {
     const j = await r.json().catch(() => ({}));
-    if (!r.ok || (j && j.type === "error")) {
-      const msg = j?.error || `${r.status} ${r.statusText}`;
+    if (!r.ok || (j && (j.type === "error" || j.detail))) {
+      const msg = j?.error || j?.detail || `${r.status} ${r.statusText}`;
       throw new Error(msg);
     }
     return j;
@@ -41,12 +41,15 @@ export default function VannamBITraining() {
     refresh();
   }, []);
 
-  async function add(kind: "ddl" | "documentation" | "sql" | "question") {
+  async function add(kind: "ddl" | "documentation" | "qsql") {
     const payload: any = {};
     if (kind === "ddl" && ddl.trim()) payload.ddl = ddl.trim();
     if (kind === "documentation" && documentation.trim()) payload.documentation = documentation.trim();
-    if (kind === "sql" && sql.trim()) payload.sql = sql.trim();
-    if (kind === "question" && question.trim()) payload.question = question.trim();
+    if (kind === "qsql") {
+      if (!qSqlQuestion.trim() || !qSqlSql.trim()) return;
+      payload.question = qSqlQuestion.trim();
+      payload.sql = qSqlSql.trim();
+    }
     if (!Object.keys(payload).length) return;
 
     try {
@@ -57,8 +60,10 @@ export default function VannamBITraining() {
       }).then(jsonOrThrow);
       if (kind === "ddl") setDdl("");
       if (kind === "documentation") setDocumentation("");
-      if (kind === "sql") setSql("");
-      if (kind === "question") setQuestion("");
+      if (kind === "qsql") {
+        setQSqlQuestion("");
+        setQSqlSql("");
+      }
       await refresh();
     } catch (e: any) {
       alert(e?.message || "Training failed");
@@ -72,7 +77,6 @@ export default function VannamBITraining() {
       u.searchParams.set("id", id);
       const r = await fetch(u.toString(), { method: "DELETE" });
       const j = await r.json().catch(() => ({}));
-      // Backend returns { ok: true } (not { success: true })
       if (j?.ok || j?.success) {
         await refresh();
       } else {
@@ -89,7 +93,7 @@ export default function VannamBITraining() {
         <div>
           <h1 className="text-2xl font-semibold">VannamBI — Training</h1>
           <p className="text-sm text-muted-foreground">
-            Add DDL, documentation, SQL, or seed questions to improve SQL generation (RAG).
+            Add DDL, documentation, or Q↔SQL examples to improve SQL generation (RAG).
           </p>
         </div>
         <a href="/vannam-bi" className="text-xs underline">← Back to VannamBI</a>
@@ -123,30 +127,26 @@ export default function VannamBITraining() {
           </button>
         </div>
 
-        <div className="rounded-xl border p-4 bg-background/60 space-y-3">
-          <h2 className="text-sm font-semibold">Add SQL Examples</h2>
+        <div className="rounded-xl border p-4 bg-background/60 space-y-3 lg:col-span-2">
+          <h2 className="text-sm font-semibold">Add Q ↔ SQL Example</h2>
+          <input
+            className="w-full h-10 box-border px-3 rounded border"
+            placeholder={`e.g. "Top 10 customers by sales?"`}
+            value={qSqlQuestion}
+            onChange={(e) => setQSqlQuestion(e.target.value)}
+          />
           <textarea
             className="w-full min-h-[140px] border rounded p-2 font-mono text-xs"
-            placeholder={`SELECT * FROM my_table WHERE ...;`}
-            value={sql}
-            onChange={(e) => setSql(e.target.value)}
+            placeholder={`SELECT ...;`}
+            value={qSqlSql}
+            onChange={(e) => setQSqlSql(e.target.value)}
           />
-          <button onClick={() => add("sql")} className="px-3 py-1.5 rounded border hover:bg-muted">
-            Train SQL
+          <button onClick={() => add("qsql")} className="px-3 py-1.5 rounded border hover:bg-muted">
+            Train Q ↔ SQL
           </button>
-        </div>
-
-        <div className="rounded-xl border p-4 bg-background/60 space-y-3">
-          <h2 className="text-sm font-semibold">Add Seed Questions</h2>
-          <textarea
-            className="w-full min-h-[140px] border rounded p-2 text-sm"
-            placeholder={`"What are daily orders?" (optional, Vanna can auto-generate too)`}
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-          />
-          <button onClick={() => add("question")} className="px-3 py-1.5 rounded border hover:bg-muted">
-            Train Question
-          </button>
+          <p className="text-xs text-muted-foreground">
+            Note: the backend requires both question and SQL for supervised examples.
+          </p>
         </div>
       </section>
 
