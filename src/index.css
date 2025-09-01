@@ -19,12 +19,11 @@
     --popover: 240 5% 6%;
     --popover-foreground: 0 0% 98%;
 
-    /* Data Science Primary Colors - Vibrant Purple/Pink */
-    --primary: 290 84% 60%;
+   /* Primary now = bluish (tailwind blue-500/600 style) */
+    --primary: 217 91% 60%;
     --primary-foreground: 0 0% 100%;
-    --primary-glow: 290 100% 80%;
-    --primary-variant: 320 84% 65%;
-
+    --primary-glow: 217 91% 75%;
+    --primary-variant: 224 76% 48%;
     /* Secondary - Electric Blue for accents */
     --secondary: 200 100% 70%;
     --secondary-foreground: 240 10% 3.9%;
@@ -47,9 +46,9 @@
     --input: 240 6% 10%;
     --ring: 290 84% 60%;
 
-    /* Node styling */
+       /* Node styling */
     --node-bg: 240 5% 8%;
-    --node-border: 290 84% 60%;
+    --node-border: 217 91% 60%;
     --node-hover: 240 5% 12%;
 
     /* Gradients for stunning effects */

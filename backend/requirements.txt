@@ -4,3 +4,13 @@ pandas==2.2.2
 numpy==1.26.4
 PyYAML==6.0.1
 python-multipart==0.0.9
+requests
+psycopg[binary]
+python-dotenv
+plotly
+vanna[chromadb,ollama,postgres]==0.7.9
+openai>=1.0.0
+vanna>=0.7.0
+chromadb
+plotly
+openai>=1.0.0
