@@ -407,7 +407,7 @@ export default function VannamBI() {
       {/* Header */}
       <header className="px-4 md:px-8 py-3 border-b flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold">Vanna.AI</h1>
+          <h1 className="text-xl font-semibold">Vannam.AI</h1>
           <span className="hidden md:inline text-xs text-muted-foreground">Ask → SQL → results → charts</span>
         </div>
         <div className="flex items-center gap-2">
