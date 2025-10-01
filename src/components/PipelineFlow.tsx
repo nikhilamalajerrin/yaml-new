@@ -1,20 +1,33 @@
-import React from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import {
-  ReactFlow,
   Background,
   Controls,
-  ConnectionLineType, // ✅ enum, not string
+  MiniMap,
+  ReactFlow,
+  useReactFlow,
+  type Edge,
+  type Node,
+  type NodeChange,
+  type EdgeChange,
+  MarkerType,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Eye } from "lucide-react";
 
-interface PipelineFlowProps {
-  nodes: any[];
-  edges: any[];
-  onNodesChange: (changes: any) => void;
-  onEdgesChange: (changes: any) => void;
-  onNodeDoubleClick: (event: any, node: any) => void;
-}
+/**
+ * Lightweight wrapper around React Flow:
+ * - smoothstep edges with arrowheads
+ * - auto fitView when nodes/edges change
+ * - dark minimap
+ * - pan/zoom enabled; nodes are selectable & deletable from parent via onNodesChange
+ */
+
+type Props = {
+  nodes: Node[];
+  edges: Edge[];
+  onNodesChange: (changes: NodeChange[]) => void;
+  onEdgesChange: (changes: EdgeChange[]) => void;
+  onNodeDoubleClick?: (evt: React.MouseEvent, node: Node) => void;
+};
 
 export function PipelineFlow({
   nodes,
@@ -22,47 +35,70 @@ export function PipelineFlow({
   onNodesChange,
   onEdgesChange,
   onNodeDoubleClick,
-}: PipelineFlowProps) {
+}: Props) {
+  const rf = useReactFlow();
+  const firstFitRef = useRef(false);
+
+  // decorate edges with markers & defaults
+  const decoratedEdges = useMemo<Edge[]>(
+    () =>
+      (edges || []).map((e) => ({
+        type: "smoothstep",
+        animated: true,
+        markerEnd: { type: MarkerType.ArrowClosed },
+        style: { strokeWidth: 3 },
+        ...e,
+      })),
+    [edges]
+  );
+
+  // initial & subsequent fit
+  useEffect(() => {
+    const hasGraph = (nodes?.length || 0) > 0;
+    if (!hasGraph) return;
+    const timeout = setTimeout(() => {
+      if (!firstFitRef.current) {
+        firstFitRef.current = true;
+        try {
+          rf.fitView({ padding: 0.2, includeHiddenNodes: true, duration: 300 });
+        } catch {}
+      } else {
+        try {
+          rf.fitView({ padding: 0.2, includeHiddenNodes: true, duration: 200 });
+        } catch {}
+      }
+    }, 0);
+    return () => clearTimeout(timeout);
+  }, [nodes?.length, decoratedEdges?.length, rf]);
+
   return (
-    <div className="w-full h-full rounded-xl bg-background/50 border border-border/30 overflow-hidden relative">
+    <div className="h-full w-full rounded-xl border border-border/50 overflow-hidden bg-background">
       <ReactFlow
         nodes={nodes}
-        edges={edges}
+        edges={decoratedEdges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeDoubleClick={onNodeDoubleClick}
         fitView
+        nodesDraggable
+        nodesConnectable={false} // we infer edges from YAML/params; no manual dragging of handles
         panOnScroll
         zoomOnScroll
-        style={{ width: "100%", height: "100%" }}
-        // nice default look for new edges
-        defaultEdgeOptions={{
-          type: "bezier",
-          animated: true,
-          style: { stroke: "hsl(var(--primary))", strokeWidth: 3 },
-        }}
-        // ❗ TS fix: use enum instead of "bezier"
-        connectionLineType={ConnectionLineType.Bezier}
+        panOnDrag
+        deleteKeyCode="Backspace"
+        selectionKeyCode="Shift"
       >
-        <Controls className="!bg-card !border-border/50" />
-        <Background color="hsl(var(--border))" gap={20} size={1} className="opacity-30" />
+        <Background />
+        <MiniMap
+          pannable
+          zoomable
+          style={{ background: "transparent" }}
+          nodeStrokeColor="hsl(var(--primary))"
+          nodeColor="hsl(var(--card))"
+          maskColor="rgba(0,0,0,0.35)"
+        />
+        <Controls showInteractive={false} />
       </ReactFlow>
-
-      {nodes.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <div className="text-center">
-            <div className="p-4 rounded-full bg-muted/20 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-              <Eye className="w-8 h-8 text-muted-foreground" />
-            </div>
-            <p className="text-muted-foreground text-lg font-medium">
-              Start building your pipeline
-            </p>
-            <p className="text-muted-foreground text-sm">
-              Add functions to create your data processing workflow
-            </p>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

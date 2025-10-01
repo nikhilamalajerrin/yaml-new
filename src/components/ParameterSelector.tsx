@@ -193,8 +193,9 @@ export function ParameterSelector({
     const nextValues: Record<string, string> = {};
 
     fields.forEach((p) => {
-      const hasInitial = initialParams[p.name] !== undefined;
-      const v = hasInitial ? initialParams[p.name] : "";
+      const init = initialParams || {};
+      const hasInitial = Object.prototype.hasOwnProperty.call(init, p.name);
+      const v = hasInitial ? init[p.name] : "";
       nextSelected[p.name] = hasInitial || !!p.required;
       nextValues[p.name] = toDisplayString(v);
     });

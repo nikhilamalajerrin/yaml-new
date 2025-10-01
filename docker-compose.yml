@@ -31,6 +31,8 @@
 #     working_dir: /usr/src/app
 #     command: npm run dev -- --host 0.0.0.0 --port 8080
 
+version: "3.9"
+
 services:
   backend:
     build:
@@ -41,25 +43,16 @@ services:
       - "8000:8000"
     env_file: .env
     environment:
-      # App DB (your Pi)
       DATABASE_URL: postgresql://dappa:bunde123123@192.168.178.157:5432/dappa
-
-      # Vanna auto-connect to your Pi DB (used by router)
       VANNA_PG_HOST: 192.168.178.157
       VANNA_PG_DB: dappa
       VANNA_PG_USER: dappa
       VANNA_PG_PASSWORD: bunde123123
       VANNA_PG_PORT: "5432"
-
-      # Talk to the Ollama *service* from inside Docker
       OLLAMA_HOST: http://ollama:11434
-
-      # Persist training / uploads
       LOCAL_STORAGE: /data
       VANNA_CHROMA_DIR: /data/chroma
-
-      # CORS for your UI
-      ALLOWED_ORIGINS: http://localhost:8080,http://192.168.178.112:8080
+      ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,http://192.168.178.112:8080
     volumes:
       - ./backend:/app
       - api_chroma:/app/.chroma
@@ -69,25 +62,53 @@ services:
         condition: service_healthy
     command: uvicorn main:app --reload --host 0.0.0.0 --port 8000
     restart: unless-stopped
+    networks:
+      - app-network
 
   frontend:
     build:
       context: .
-      dockerfile: Dockerfile
     container_name: td-frontend
     depends_on:
       - backend
+      - jupyter
     ports:
       - "8080:8080"
     environment:
       VITE_IN_DOCKER: "1"
       CHOKIDAR_USEPOLLING: "true"
+      VITE_JUPYTER_URL: http://localhost:8888
     volumes:
       - .:/usr/src/app
       - /usr/src/app/node_modules
     working_dir: /usr/src/app
     command: npm run dev -- --host 0.0.0.0 --port 8080
     restart: unless-stopped
+    networks:
+      - app-network
+
+  jupyter:
+    image: jupyter/base-notebook:python-3.11
+    container_name: jupyter
+    ports:
+      - "8888:8888"
+    command:
+      - start-notebook.sh
+      - --ServerApp.token=
+      - --ServerApp.allow_origin=*
+      - --ServerApp.allow_credentials=True
+      - --ServerApp.disable_check_xsrf=True
+      - --ServerApp.trust_xheaders=True
+      - >-
+        --ServerApp.tornado_settings={"headers":{"Content-Security-Policy":
+        "frame-ancestors http://localhost:8080 http://127.0.0.1:8080 *"}}
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+    volumes:
+      - notebooks:/home/jovyan/work
+    restart: unless-stopped
+    networks:
+      - app-network
 
   ollama:
     image: ollama/ollama:0.11.6
@@ -95,12 +116,10 @@ services:
     ports:
       - "11434:11434"
     environment:
-      # Listen on all interfaces inside the container
       OLLAMA_HOST: "0.0.0.0:11434"
-      VANNA_ALLOW_LLM_TO_SEE_DATA: "true" 
+      VANNA_ALLOW_LLM_TO_SEE_DATA: "true"
     volumes:
       - ollama_models:/root/.ollama
-    # Healthcheck so backend waits until the API is up
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 5s
@@ -108,8 +127,15 @@ services:
       retries: 30
       start_period: 5s
     restart: unless-stopped
+    networks:
+      - app-network
 
 volumes:
   api_chroma:
   data_share:
   ollama_models:
+  notebooks:
+
+networks:
+  app-network:
+    driver: bridge
