@@ -19,7 +19,7 @@ This project is a **declarative YAML-based workflow engine** that allows users t
 
 
 
-![image](https://static01.bbi.io/2Wt9Tk.jpg)
+![image](https://i.imgur.com/gUxLKFM.png)
 
 ## 🚀 Features
 
