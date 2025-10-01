@@ -18,7 +18,7 @@
 This project is a **declarative YAML-based workflow engine** that allows users to define, visualize, and execute data processing pipelines interactively. It integrates **Polars, NetworkX, and PyVis** to provide a structured and dynamic workflow execution system. This also includes a lightweight Business Intelligence (BI) application that transforms natural-language questions into PostgreSQL queries using Vanna (RAG + LLM). It executes the SQL and provides options to visualize results as charts or export them as CSV files.
 
 
-![Interface]([https://imgur.com/a/WHQ8jPR])
+![Tharavu Dappa Upload Interface](https://imgur.com/a/WHQ8jPR)
 
 ## 🚀 Features
 
